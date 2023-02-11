@@ -1099,7 +1099,7 @@ int main(int argc, char **argv) {
 	}
 
 	if (path_index != argc - 1) {
-		fprintf(stderr, "Usage: %s [options] path_to_sync\n\nAvailable options:\n\t--keygen path\tgenerate new network key in path\n\t--keypath path\tuse network keys in given path (default is current path)\n\t--port\t\tuse TCP port (default 4804)\n\t--enable-delete\tenable file delete propagation [disabled by default]\n\n", argv[0]);
+		fprintf(stderr, "Usage: %s [options] path_to_sync\n\nAvailable options:\n\t--genkey path\tgenerate new network key in path\n\t--keypath path\tuse network keys in given path (default is current path)\n\t--port\t\tuse TCP port (default 4804)\n\t--enable-delete\tenable file delete propagation [disabled by default]\n\n", argv[0]);
 		exit(1);
 	}
 
