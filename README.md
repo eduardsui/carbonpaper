@@ -5,8 +5,6 @@ What it is?
 -----------
 carbonpaper is a lightweight simple yet efficient real-time file syncronizer across multiple servers. It uses a simple network protocol, an asynchronous socket, Ed25519 signature/verify, x25519 key exchange and chacha20 for network traffic encryption.
 
-Currently `delete` is not supported (file are syncronized, but not deleted if deleted from one node).
-
 Main features:
 - fast
 - bidirectional
@@ -18,7 +16,7 @@ Main features:
 
 Disadvantages:
 - atomic write/reads (entire file is synchronized at once - no partial updates)
-- default file limit is 128Mb (files greater than 128Mb will not be synchronized)
+- default file size limit is 128Mb (files greater than 128Mb will not be synchronized)
 
 
 Compiling
@@ -48,3 +46,4 @@ Then, on each machine:
 
 `$ carbonpaper --host ip1 --host ip2 ~/dir/to/sync/`
 
+Note: file delete sync is disabled by default. You can enable it by running with `--enable-delete`
