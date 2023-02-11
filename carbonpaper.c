@@ -27,6 +27,7 @@
 
 #define EVENT_SIZE	(sizeof (struct inotify_event))
 #define EVENT_BUF_LEN	(1024 * (EVENT_SIZE + 16 ))
+#define DELETE_CACHE	1024
 
 #define MAX_MESSAGE	0x8000000
 #define MAX_PATH	4096
@@ -338,6 +339,9 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 	int i = 0;
 	khint_t k;
 
+	char *to_delete[DELETE_CACHE];
+	int to_delete_files = 0;
+
 	while (i < length) {
 		struct inotify_event *event = (struct inotify_event *)&events[i];
 		k = kh_get(fd_to_name, hash_table, event->wd);
@@ -345,6 +349,20 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 			snprintf(path_buf, sizeof(path_buf), "%s/%s", kh_value(hash_table, k), event->name);
 			if (((!lstat(path_buf, &buf)) || (event->mask & IN_DELETE) || (event->mask & IN_MOVED_TO) || (event->mask & IN_MOVED_FROM)) && (((buf.st_mode & S_IFMT) == S_IFDIR) || ((buf.st_mode & S_IFMT) == S_IFREG) || ((buf.st_mode & S_IFMT) == S_IFLNK))) {
 				// filename/dirname event->name
+
+				// check if delete operation is cached
+				for (int i = 0; i < to_delete_files; i ++) {
+					if (!strcmp(to_delete[i], path_buf)) {
+						fprintf(stderr, "reject delete - file recreated [%s]\n", path_buf);
+						free(to_delete[i]);
+						for (int j = i; j < to_delete_files - 1; j ++)
+							to_delete[j] = to_delete[j + 1];
+						to_delete[to_delete_files] = 0;
+						to_delete_files --;
+						i --;
+					}
+				}
+
 				if (event->mask & IN_CREATE) {
 					if (event->mask & IN_ISDIR) {
 						int wd = watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
@@ -358,8 +376,10 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 					if (event->mask & IN_ISDIR)
 						notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
 					else
-					if (enable_file_delete)
-						notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
+					if (enable_file_delete) {
+						if (to_delete_files < DELETE_CACHE)
+							to_delete[to_delete_files ++] = strdup(path_buf);
+					}
 				} else
 				if (event->mask & IN_CLOSE_WRITE) {
 					fprintf(stdout, "written [%s]\n", path_buf);
@@ -385,6 +405,16 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 		}
 		i += EVENT_SIZE + event->len;
 	}
+	for (int i = 0; i < to_delete_files; i ++) {
+		fprintf(stderr, "deleting cache: %s\n", to_delete[i]);
+		if (to_delete[i]) {
+			notifyEvent(loop, to_delete[i], "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
+			free(to_delete[i]);
+			to_delete[i] = 0;
+		}
+	}
+	to_delete_files = 0;
+
 	return 0;
 }
 
@@ -1151,7 +1181,7 @@ int main(int argc, char **argv) {
 		loop_schedule(&loop, {
 			int i;
 			for (i = 0; i < clients; i ++) {
-				if ((!hosts[i].sock) || (time(NULL) - hosts[i].timestamp >= 16)) {
+				if ((!hosts[i].sock) || (time(NULL) - hosts[i].timestamp >= 48)) {
 					client_connect(loop, &hosts[i], local_public_key);
 				} else {
 					if (hosts[i].sock)
