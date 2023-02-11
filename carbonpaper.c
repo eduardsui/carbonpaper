@@ -129,7 +129,112 @@ void closeSocket(int sock) {
 	fprintf(stderr, "remove socket\n");
 }
 
-int consume(int inotify_fd, const char *events, int length, khash_t(fd_to_name) *hash_table) {
+int sharedSecret(unsigned char shared[32], unsigned char local_private_key[32], unsigned char remote_public_key[32]) {
+	crypto_x25519(shared, local_private_key, remote_public_key);
+	return 0;
+}
+
+int encrypt(const unsigned char *pt, unsigned char *ct, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], int ctr) {
+	unsigned char key[32];
+	sharedSecret(key, local_private_key, remote_public_key);
+	u8 nonce[8];
+
+	memset(nonce, 0, sizeof(nonce));
+	nonce[7] = 4;
+
+	if (!crypto_chacha20_djb(ct, pt, size, key, nonce, ctr))
+		return 0;
+	return size;
+}
+
+int encryptSign(const unsigned char *pt, unsigned char *ct, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], unsigned char private_key[64], int ctr) {
+	int enc_size = encrypt(pt, ct, size, local_private_key, remote_public_key, ctr);
+	crypto_eddsa_sign(ct + enc_size, private_key, ct, enc_size);
+	return enc_size + 64;
+}
+
+int decrypt(const unsigned char *ct, unsigned char *pt, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], int ctr) {
+	return encrypt(ct, pt, size, local_private_key, remote_public_key, ctr);
+}
+
+int decryptVerify(unsigned char *ct, unsigned char *pt, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], unsigned char public_key[32], int ctr) {
+	if (size < 64)
+		return -1;
+
+	if (crypto_eddsa_check(ct + size - 64, public_key, ct, size - 64))
+		return -1;
+
+	return decrypt(ct, pt, size - 64, local_private_key, remote_public_key, ctr);
+}
+
+int sendData(struct doops_loop *loop, struct remote_client *host, int socket, const unsigned char *data, int len, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], unsigned char remote_public_key[32], khash_t(fd_to_name) *hash_table) {
+	int msg_size = len + sizeof(int) + 64;
+	unsigned char *buffer = (unsigned char *)malloc(msg_size);
+	if (!buffer) {
+		perror("malloc");
+		loop_remove_io(loop, socket);
+		closeSocket(socket);
+		return -1;
+	}
+
+	*(int *)buffer = htonl(msg_size - sizeof(int));
+
+	if (encryptSign(data, buffer + sizeof(int), len, local_private_key, remote_public_key, private_key, 0) <= 0) {
+		fprintf(stderr, "encryption error");
+		free(buffer);
+		loop_remove_io(loop, socket);
+		closeSocket(socket);
+		return -1;		
+	}
+
+	if (addToBuffer(loop, host, socket, buffer, msg_size) < 0) {
+		loop_remove_io(loop, socket);
+		closeSocket(socket);
+		free(buffer);
+		return -1;
+	}
+
+	free(buffer);
+	return msg_size;
+}
+
+int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
+	struct stat buf;
+	if (lstat(path, &buf)) {
+		if (strcmp(event_type, "deleted")) {
+			perror("lstat");
+			return -1;
+		}
+		memset(&buf, 0, sizeof(buf));
+	}
+	unsigned char buffer[MAX_PATH * 2];
+	int size = snprintf((char *)buffer, MAX_PATH * 2, "DESC\n%s:%i:%o:%s\n", event_type, buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
+	int i = 0;
+	for (i = 0; i < clients; i ++) {
+		if (hosts[i].sock > 0)
+			sendData(loop, &hosts[i], hosts[i].sock, buffer, size, public_key, private_key, local_public_key, local_private_key, hosts[i].public_key, hash_table);
+
+		if (hosts[i].sock_accept > 0)
+			sendData(loop, &hosts[i], hosts[i].sock_accept, buffer, size, public_key, private_key, local_public_key, local_private_key, hosts[i].public_key, hash_table);
+	}
+	return 0;
+}
+
+int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table) {
+	int wd = inotify_add_watch(inotify_fd, path_buf, INOTIFY_FLAGS);
+	if (wd >= 0) {
+		int absent;
+		khint_t k = kh_put(fd_to_name, hash_table, wd, &absent);
+		if (!absent)
+			free((char *)kh_value(hash_table, k));
+		kh_value(hash_table, k) = strdup(path_buf);
+		return wd;
+	} else
+		perror("inotify_add_watch");
+	return wd;
+}
+
+int consume(struct doops_loop *loop, int inotify_fd, const char *events, int length, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
 	if (!events)
 		return -1;
 
@@ -138,6 +243,7 @@ int consume(int inotify_fd, const char *events, int length, khash_t(fd_to_name) 
 
 	int i = 0;
 	khint_t k;
+
 	while (i < length) {
 		struct inotify_event *event = (struct inotify_event *)&events[i];
 		k = kh_get(fd_to_name, hash_table, event->wd);
@@ -148,73 +254,35 @@ int consume(int inotify_fd, const char *events, int length, khash_t(fd_to_name) 
 				// filename/dirname event->name
 				if (event->mask & IN_CREATE) {
 					fprintf(stdout, "created [%s]\n", path_buf);
-
-					int wd = inotify_add_watch(inotify_fd, path_buf, INOTIFY_FLAGS);
-					if (wd >= 0) {
-						int absent;
-						k = kh_put(fd_to_name, hash_table, wd, &absent);
-						if (!absent)
-							free((char *)kh_value(hash_table, k));
-						kh_value(hash_table, k) = strdup(path_buf);
-					} else
-						perror("inotify_add_watch");
-				
-
-					if (event->mask & IN_ISDIR) {
-						// directory created
-					} else {
-						// file created
-					}
+					watch(inotify_fd, path_buf, hash_table);
+					if (event->mask & IN_ISDIR)
+						notifyEvent(loop, path_buf, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_DELETE) {
-					if (inotify_rm_watch(inotify_fd, event->wd)) {
+					/* if (inotify_rm_watch(inotify_fd, event->wd)) {
 						perror("inotify_rm_watch");
 					} else {
 						if (kh_exist(hash_table, k)) {
 							free((char *)kh_value(hash_table, k));
 							kh_del(fd_to_name, hash_table, k);
 						}
-					}
+					} */
 
 					fprintf(stdout, "deleted [%s]\n", path_buf);
-					if (event->mask & IN_ISDIR) {
-						// directory deleted
-					} else {
-						// file deleted
-					}
+					if (event->mask & IN_ISDIR)
+						notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_CLOSE_WRITE) {
-					if (inotify_rm_watch(inotify_fd, event->wd)) {
-						perror("inotify_rm_watch");
-					} else {
-						if (kh_exist(hash_table, k)) {
-							free((char *)kh_value(hash_table, k));
-							kh_del(fd_to_name, hash_table, k);
-						}
-					}
-
-					fprintf(stdout, "deleted [%s]\n", path_buf);
-					if (event->mask & IN_ISDIR) {
-						// directory deleted
-					} else {
-						// file deleted
-					}
+					fprintf(stdout, "written [%s]\n", path_buf);
+					notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_ATTRIB) {
 					fprintf(stdout, "attr [%s] changed\n", path_buf);
-					if (event->mask & IN_ISDIR) {
-						// directory attributes changed
-					} else {
-						// file attributes changed
-					}
+					notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_MOVED_TO) {
 					fprintf(stdout, "moved to [%s]\n", path_buf);
-					if (event->mask & IN_ISDIR) {
-						// directory attributes changed
-					} else {
-						// file attributes changed
-					}
+					notifyEvent(loop, path_buf, "move", public_key, private_key, local_public_key, local_private_key, hash_table);
 				}
 			} else {
 				perror("lstat");
@@ -231,6 +299,7 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 		perror("opendir");
 		return -1;
 	}
+	fprintf(stderr, "scanning [%s]\n", path);
 
 	char path_buf[MAX_PATH];
 	struct dirent *file;
@@ -249,16 +318,7 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 
 
 		if (((buf.st_mode & S_IFMT) == S_IFDIR) || ((buf.st_mode & S_IFMT) == S_IFREG) || ((buf.st_mode & S_IFMT) == S_IFLNK)) {
-			int wd = inotify_add_watch(inotify_fd, path_buf, INOTIFY_FLAGS);
-			if (wd >= 0) {
-				int absent;
-				khint_t k = kh_put(fd_to_name, hash_table, wd, &absent);
-				if (!absent)
-					free((char *)kh_value(hash_table, k));
-				kh_value(hash_table, k) = strdup(path_buf);
-			} else {
-				perror("inotify_add_watch");
-			}
+			watch(inotify_fd, path_buf, hash_table);
 
 			if ((buf.st_mode & S_IFMT) == S_IFDIR)
 				scan_directory(inotify_fd, path_buf, hash_table);
@@ -345,6 +405,7 @@ int readFile(unsigned char *buf, int size, char *path) {
 
 int writeFileAuto(unsigned char *data, int size) {
 	char full_path[MAX_PATH];
+	static unsigned int file_write_index = 0;
 
 	char *line = (char *)data;
 	unsigned char *file_data = (unsigned char *)strchr((char *)data, '\n');
@@ -372,13 +433,33 @@ int writeFileAuto(unsigned char *data, int size) {
 
 	int mtime = atoi(line);
 
+
 	int file_size = size - (file_data - (unsigned char *)line);
 	
 	snprintf(full_path, sizeof(full_path), "%s/%s", root_path, path);
 
-	const char *sync_file = ".sync";
+	struct stat buf;
+	if ((!lstat(path, &buf)) && (buf.st_mtime >= mtime) && (buf.st_mode == mode)) {
+		fprintf(stderr, "local file is newer %s\n",  full_path);
+		return 0;
+	}
+
+	char sync_file[MAX_PATH];
+
+	char *filename = strrchr(path, '/');
+	if (!filename)
+		filename = strrchr(path, '\\');
+	if (filename)
+		filename ++;
+
+	file_write_index ++;
+	if (filename)
+		snprintf(sync_file, sizeof(sync_file), ".sync.%08x.%s", file_write_index, filename);
+	else
+		snprintf(sync_file, sizeof(sync_file), ".sync.%08x", file_write_index);
 
 	if ((mode & S_IFMT) == S_IFLNK) {
+		rmdir(sync_file);
 		unlink(sync_file);
 		if (symlink((char *)file_data, sync_file)) {
 			perror("symlink");
@@ -391,6 +472,15 @@ int writeFileAuto(unsigned char *data, int size) {
 		times[1].tv_sec = mtime;
 		times[1].tv_usec = 0;
 		lutimes(sync_file, times);
+
+		unlink(full_path);
+		rmdir(full_path);
+		if (rename(sync_file, full_path)) {
+			perror("rename");
+			unlink(sync_file);
+			return -1;
+		}
+
 		return 0;
 	} else {
 		int fd = open(sync_file, O_WRONLY | O_CREAT | O_TRUNC, mode);
@@ -422,6 +512,14 @@ int writeFileAuto(unsigned char *data, int size) {
 	times.actime = mtime;
 	times.modtime = mtime;
 	utime(sync_file, &times);
+
+	rmdir(full_path);
+	unlink(full_path);
+	if (rename(sync_file, full_path)) {
+		perror("rename");
+		unlink(sync_file);
+		return -1;
+	}
 
 	return 0;
 }
@@ -552,11 +650,6 @@ int genLocalKey(unsigned char private_key[32], unsigned char public_key[32]) {
 	return 0;
 }
 
-int sharedSecret(unsigned char shared[32], unsigned char local_private_key[32], unsigned char remote_public_key[32]) {
-	crypto_x25519(shared, local_private_key, remote_public_key);
-	return 0;
-}
-
 int loadFile(const char *path, const char *filename, unsigned char *buf, int max_size) {
 	char full_path[MAX_PATH];
 
@@ -565,71 +658,7 @@ int loadFile(const char *path, const char *filename, unsigned char *buf, int max
 	return readFile(buf, max_size, full_path);
 }
 
-int encrypt(const unsigned char *pt, unsigned char *ct, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], int ctr) {
-	unsigned char key[32];
-	sharedSecret(key, local_private_key, remote_public_key);
-	u8 nonce[8];
-
-	memset(nonce, 0, sizeof(nonce));
-	nonce[7] = 4;
-
-	if (!crypto_chacha20_djb(ct, pt, size, key, nonce, ctr))
-		return 0;
-	return size;
-}
-
-int encryptSign(const unsigned char *pt, unsigned char *ct, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], unsigned char private_key[64], int ctr) {
-	int enc_size = encrypt(pt, ct, size, local_private_key, remote_public_key, ctr);
-	crypto_eddsa_sign(ct + enc_size, private_key, ct, enc_size);
-	return enc_size + 64;
-}
-
-int decrypt(const unsigned char *ct, unsigned char *pt, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], int ctr) {
-	return encrypt(ct, pt, size, local_private_key, remote_public_key, ctr);
-}
-
-int decryptVerify(unsigned char *ct, unsigned char *pt, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], unsigned char public_key[32], int ctr) {
-	if (size < 64)
-		return -1;
-
-	if (crypto_eddsa_check(ct + size - 64, public_key, ct, size - 64))
-		return -1;
-
-	return decrypt(ct, pt, size - 64, local_private_key, remote_public_key, ctr);
-}
-
-int sendData(struct doops_loop *loop, struct remote_client *host, int socket, const unsigned char *data, int len, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], unsigned char remote_public_key[32], khash_t(fd_to_name) *hash_table) {
-	int msg_size = len + sizeof(int) + 64;
-	unsigned char *buffer = (unsigned char *)malloc(msg_size);
-	if (!buffer) {
-		perror("malloc");
-		loop_remove_io(loop, socket);
-		closeSocket(socket);
-		return -1;
-	}
-
-	*(int *)buffer = htonl(msg_size - sizeof(int));
-
-	if (encryptSign(data, buffer + sizeof(int), len, local_private_key, remote_public_key, private_key, 0) <= 0) {
-		fprintf(stderr, "encryption error");
-		free(buffer);
-		loop_remove_io(loop, socket);
-		closeSocket(socket);
-		return -1;		
-	}
-
-	if (addToBuffer(loop, host, socket, buffer, msg_size) < 0) {
-		loop_remove_io(loop, socket);
-		closeSocket(socket);
-		free(buffer);
-		return -1;
-	}
-
-	free(buffer);
-	return msg_size;
-}
-
-int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
+int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], int inotify_fd, khash_t(fd_to_name) *hash_table) {
 	unsigned char *buffer = NULL;
 	unsigned int msg_size = 0;
 	char full_path[MAX_PATH];
@@ -700,6 +729,10 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	} else {
 		pt[size] = 0;
 		if (size >= 4) {
+			int is_desc = 0;
+			if (memcmp(pt, "DESC", 4) == 0)
+				is_desc = 1;	
+
 			if (memcmp(pt, "PING", 4) == 0) {
 				sendData(loop, host, socket, (const unsigned char *)"PONG", 4, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table);
 			} else
@@ -712,7 +745,6 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 			} else
 			if (memcmp(pt, "PULL", 4) == 0) {
 				snprintf(full_path, sizeof(full_path), "%s/%s", root_path, pt + 5);
-				fprintf(stderr, "REQ: %s\n", pt + 5);
 				int fsize = -1;
 				unsigned char *file_data = readFileAuto(full_path, &fsize);
 				if ((file_data) && (fsize > 0)) {
@@ -724,7 +756,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 			if (memcmp(pt, "DATA", 4) == 0) {
 				writeFileAuto(pt + 5, size - 5);
 			} else
-			if (memcmp(pt, "LIST", 4) == 0) {
+			if ((memcmp(pt, "LIST", 4) == 0) || (is_desc)) {
 				char *list = (char *)pt + 5;
 				char *line = list;
 				while (line) {
@@ -732,6 +764,17 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 					if (list) {
 						list[0] = 0;
 						list ++;
+
+						char *event_type = NULL;
+						if (is_desc) {
+							char *new_line = strchr(line, ':');
+							if (new_line) {
+								event_type = line;
+								new_line[0] = 0;
+								new_line ++;
+								line = new_line;
+							}
+						}
 
 						char *mode_str = strchr(line, ':');
 						if (mode_str) {
@@ -757,6 +800,8 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 
 								int sync = 0;
 								struct stat buf;
+								memset(&buf, 0, sizeof(buf));
+
 								if (lstat(full_path, &buf)) {
 									if (((mode & S_IFMT) != S_IFDIR) || (mkdir(full_path, mode & ~S_IFMT)))
 										sync = 1;
@@ -773,6 +818,14 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 										times.modtime = mtime;
 
 										utime(full_path, &times);
+										sync = 0;
+									}
+								}
+								if (event_type) {
+									fprintf(stderr, "event: %s\n", event_type);
+									if (strcmp(event_type, "deleted") == 0) {
+										unlink(full_path);
+										rmdir(full_path);
 										sync = 0;
 									}
 								}
@@ -1134,9 +1187,9 @@ int main(int argc, char **argv) {
 		} else
 		if (fd == inotify_fd) {
 			int length = read(fd, buffer, EVENT_BUF_LEN); 
-			consume(fd, buffer, length, hash_table);
+			consume(loop, fd, buffer, length, public_key, private_key, local_public_key, local_private_key, hash_table);
 		} else {
-			receiveData(loop, fd, public_key, private_key, local_public_key, local_private_key, hash_table);
+			receiveData(loop, fd, public_key, private_key, local_public_key, local_private_key, inotify_fd, hash_table);
 		}
     	});
 	loop_run(&loop);
