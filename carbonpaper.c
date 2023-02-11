@@ -9,6 +9,7 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -211,7 +212,7 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 		memset(&buf, 0, sizeof(buf));
 	}
 	unsigned char buffer[MAX_PATH * 2];
-	int size = snprintf((char *)buffer, MAX_PATH * 2, "DESC\n%s:%u:%o:%s\n", event_type, (unsigned int)buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
+	int size = snprintf((char *)buffer, MAX_PATH * 2, "DESC\n%s:%u.%u:%o:%s\n", event_type, (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
 	int i = 0;
 	for (i = 0; i < clients; i ++) {
 		if (hosts[i].sock > 0)
@@ -435,7 +436,7 @@ char *list(khash_t(fd_to_name) *hash_table, int root_len, int *written_len) {
 			if (lstat(path, &buf))
 				continue;
 
-			*written_len += snprintf(buffer + *written_len, buf_size - *written_len, "%i:%o:%s\n", (int)buf.st_mtime, (int)(buf.st_mode), path + root_len);
+			*written_len += snprintf(buffer + *written_len, buf_size - *written_len, "%u.%u:%o:%s\n", (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, (int)(buf.st_mode), path + root_len);
 			if (buf_size - *written_len < 0x8000) {
 				buf_size += 1024 * 1024;
 				buffer = (char *)realloc(buffer, buf_size);
@@ -605,10 +606,12 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 		close(fd);
 	}
 
-	struct utimbuf times;
-	times.actime = mtime;
-	times.modtime = mtime;
-	utime(sync_file, &times);
+	struct timeval times[2];
+	times[0].tv_sec = mtime;
+	times[0].tv_usec = 0;
+	times[1].tv_sec = mtime;
+	times[1].tv_usec = 0;
+	lutimes(sync_file, times);
 
 	if (renameFileOrDirectoryNoEvent(inotify_fd, sync_file, full_path, hash_table)) {
 		unlink(sync_file);
@@ -635,7 +638,7 @@ unsigned char *readFileAuto(char *path, int *size) {
 		*size = MAX_PATH + 4096;
 		buffer = (unsigned char *)malloc(*size);
 		if (buffer) {
-			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u:%o:%s\n", (unsigned int)buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
+			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u.%u:%o:%s\n", (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
 			int link_buf = readlink(path, (char *)buffer + bytes_read, *size - bytes_read);
 			if (link_buf < 0) {
 				perror("readlink");
@@ -662,7 +665,7 @@ unsigned char *readFileAuto(char *path, int *size) {
 	if ((*size >= 0) && (*size <= MAX_MESSAGE - 0x400)) {
 		buffer = (unsigned char *)malloc(*size + 4096);
 		if (buffer) {
-			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u:%o:%s\n", (unsigned int)buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
+			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u.%u:%o:%s\n", (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
 			*size += bytes_read;
 			while (bytes_read < *size) {
 				int bytes = read(fd, buffer + bytes_read, *size - bytes_read);
@@ -899,11 +902,20 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 									if (((mode & S_IFMT) != S_IFDIR) || (mkdirAuto(full_path, mode & ~S_IFMT, inotify_fd, hash_table)))
 										sync = 1;
 								} else {
-									if (buf.st_mtime < mtime)
+									if (buf.st_mtime < mtime) {
 										sync = 1;
-									else
-									if (buf.st_mtime > mtime)
+									} else
+									if (buf.st_mtime > mtime) {
 										sync = 2;
+									} else {
+										char *ref = strchr(line, '.');
+										if ((ref) && (ref[0])) {
+											// check size
+											if (buf.st_size < atoi(ref + 1))
+												sync = 1;
+										}
+									}
+
 
 									if ((sync == 1) && ((buf.st_mode & S_IFMT) == S_IFDIR) && ((mode & S_IFMT) == S_IFDIR)) {
 										struct utimbuf times;
