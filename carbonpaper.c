@@ -22,7 +22,8 @@
 #include "doops.h"
 #include "monocypher.c"
 
-#define INOTIFY_FLAGS	IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB  | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+#define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB  | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+#define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB  | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
 
 #define EVENT_SIZE	(sizeof (struct inotify_event))
 #define EVENT_BUF_LEN	(1024 * (EVENT_SIZE + 16 ))
@@ -208,7 +209,7 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 		memset(&buf, 0, sizeof(buf));
 	}
 	unsigned char buffer[MAX_PATH * 2];
-	int size = snprintf((char *)buffer, MAX_PATH * 2, "DESC\n%s:%i:%o:%s\n", event_type, buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
+	int size = snprintf((char *)buffer, MAX_PATH * 2, "DESC\n%s:%u:%o:%s\n", event_type, (unsigned int)buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
 	int i = 0;
 	for (i = 0; i < clients; i ++) {
 		if (hosts[i].sock > 0)
@@ -220,8 +221,8 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 	return 0;
 }
 
-int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table) {
-	int wd = inotify_add_watch(inotify_fd, path_buf, INOTIFY_FLAGS);
+int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
+	int wd = inotify_add_watch(inotify_fd, path_buf, flags);
 	if (wd >= 0) {
 		int absent;
 		khint_t k = kh_put(fd_to_name, hash_table, wd, &absent);
@@ -268,7 +269,7 @@ int mkFullDir(int inotify_fd, const char *filename_with_path, khash_t(fd_to_name
 			times.modtime = 0;
 			utime(name, &times);
 
-			watch(inotify_fd, full_path, hash_table);
+			watch(inotify_fd, full_path, hash_table, INOTIFY_FLAGS);
 		}
 
 		dir[0] = '/';
@@ -315,10 +316,11 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 
 
 		if (((buf.st_mode & S_IFMT) == S_IFDIR) || ((buf.st_mode & S_IFMT) == S_IFREG) || ((buf.st_mode & S_IFMT) == S_IFLNK)) {
-			watch(inotify_fd, path_buf, hash_table);
-
-			if ((buf.st_mode & S_IFMT) == S_IFDIR)
+			if ((buf.st_mode & S_IFMT) == S_IFDIR) {
+				watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 				scan_directory(inotify_fd, path_buf, hash_table);
+			} else
+				watch(inotify_fd, path_buf, hash_table, INOTIFY_FILE_FLAGS);
 		}
 	}
 	closedir(dir);
@@ -344,7 +346,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				// filename/dirname event->name
 				if (event->mask & IN_CREATE) {
 					if (event->mask & IN_ISDIR) {
-						int wd = watch(inotify_fd, path_buf, hash_table);
+						int wd = watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 						fprintf(stdout, "created [%s], wd: %i\n", path_buf, wd);
 						scan_directory(inotify_fd, path_buf, hash_table);
 					}
@@ -362,7 +364,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				if (event->mask & IN_ATTRIB) {
 					fprintf(stdout, "attr [%s] changed\n", path_buf);
 					if (event->mask & IN_ISDIR) {
-						watch(inotify_fd, path_buf, hash_table);
+						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 						scan_directory(inotify_fd, path_buf, hash_table);
 					}
 					notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
@@ -370,7 +372,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				if (event->mask & IN_MOVED_TO) {
 					fprintf(stdout, "moved to [%s]\n", path_buf);
 					if (event->mask & IN_ISDIR) {
-						watch(inotify_fd, path_buf, hash_table);
+						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 						scan_directory(inotify_fd, path_buf, hash_table);
 					}
 					notifyEvent(loop, path_buf, "move", public_key, private_key, local_public_key, local_private_key, hash_table);
@@ -457,7 +459,7 @@ int readFile(unsigned char *buf, int size, char *path) {
 	return bytes_read;
 }
 
-int mkdirAuto(char *full_path, int mode, int inotify_fd, khash_t(fd_to_name) *hash_table) {
+int mkdirAuto(char *full_path, mode_t mode, int inotify_fd, khash_t(fd_to_name) *hash_table) {
 	int err = mkdir(full_path, mode);
 	if (err) {
 		mkFullDir(inotify_fd, full_path, hash_table);
@@ -465,7 +467,7 @@ int mkdirAuto(char *full_path, int mode, int inotify_fd, khash_t(fd_to_name) *ha
 	}
 
 	if (!err)
-		watch(inotify_fd, full_path, hash_table);
+		watch(inotify_fd, full_path, hash_table, INOTIFY_FLAGS);
 	return err;
 }
 
@@ -487,7 +489,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 	mode_str[0] = 0;
 	mode_str ++;
 
-	int mode = 0;
+	mode_t mode = 0;
 	sscanf(mode_str, "%o", &mode);
 
 	char *path = strchr(mode_str, ':');
@@ -505,7 +507,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 
 	struct stat buf;
 	if ((!lstat(path, &buf)) && (buf.st_mtime > mtime) && (buf.st_mode == mode)) {
-		fprintf(stderr, "local file is newer %s (%i > %i)\n",  full_path, buf.st_mtime, mtime);
+		fprintf(stderr, "local file is newer %s (%u > %u)\n",  full_path, (unsigned int)buf.st_mtime, (unsigned int)mtime);
 		return 0;
 	}
 
@@ -579,6 +581,8 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 		return -1;
 	}
 
+	watch(inotify_fd, full_path, hash_table, INOTIFY_FILE_FLAGS);
+
 	return 0;
 }
 
@@ -597,7 +601,7 @@ unsigned char *readFileAuto(char *path, int *size) {
 		*size = MAX_PATH + 4096;
 		buffer = (unsigned char *)malloc(*size);
 		if (buffer) {
-			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%i:%o:%s\n", buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
+			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u:%o:%s\n", (unsigned int)buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
 			int link_buf = readlink(path, (char *)buffer + bytes_read, *size - bytes_read);
 			if (link_buf < 0) {
 				perror("readlink");
@@ -624,7 +628,7 @@ unsigned char *readFileAuto(char *path, int *size) {
 	if ((*size >= 0) && (*size <= MAX_MESSAGE - 0x400)) {
 		buffer = (unsigned char *)malloc(*size + 4096);
 		if (buffer) {
-			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%i:%o:%s\n", buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
+			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u:%o:%s\n", (unsigned int)buf.st_mtime, buf.st_mode, (char *)path + root_path_len + 1);
 			*size += bytes_read;
 			while (bytes_read < *size) {
 				int bytes = read(fd, buffer + bytes_read, *size - bytes_read);
@@ -751,7 +755,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 		closeSocket(socket);
 		return -1;
 	}
-	int len_received = 0;
+	unsigned int len_received = 0;
 	while (len_received < msg_size) {
 		recv_size = recv(socket, buffer + len_received, msg_size - len_received, MSG_NOSIGNAL);
 		if (recv_size <= 0) {
@@ -846,7 +850,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 								}
 
 								time_t mtime = atoi(line);
-								int mode = 0;
+								mode_t mode = 0;
 								sscanf(mode_str, "%o", &mode);
 
 								char request_data[MAX_PATH + 5];
@@ -1069,7 +1073,7 @@ int main(int argc, char **argv) {
 	memcpy(public_key, private_key + sizeof(public_key), sizeof(public_key));
 
 	if (genLocalKey(local_private_key, local_public_key)) {
-		fprintf(stderr, "Error generating local key pair.\n\n", key_path);
+		fprintf(stderr, "Error generating local key pair.\n\n");
 		exit(1);
 	}
 
