@@ -39,6 +39,7 @@ Usage
 -----------
 
 First you need to create a key:
+
 `$ carbonpaper --genkey .`
 
 The resulting `.carbonpaper.key` must pe copied on all the servers.
