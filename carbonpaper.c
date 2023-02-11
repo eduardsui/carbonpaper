@@ -433,7 +433,6 @@ int writeFileAuto(unsigned char *data, int size) {
 
 	int mtime = atoi(line);
 
-
 	int file_size = size - (file_data - (unsigned char *)line);
 	
 	snprintf(full_path, sizeof(full_path), "%s/%s", root_path, path);
@@ -612,12 +611,8 @@ int genKey(const char *path) {
 
 	char full_path[MAX_PATH];
 
-	snprintf(full_path, sizeof(full_path), "%s/.private_key", path);
+	snprintf(full_path, sizeof(full_path), "%s/.carbonpaper.key", path);
 	if (writeFile(private_key, sizeof(private_key), full_path))
-		return -1;
-
-	snprintf(full_path, sizeof(full_path), "%s/.public_key", path);
-	if (writeFile(public_key, sizeof(public_key), full_path))
 		return -1;
 
 	fprintf(stdout, "generated key pair in [%s]\n", path);
@@ -1002,15 +997,12 @@ int main(int argc, char **argv) {
 		exit(1);
 	}
 
-	if (loadFile(key_path, ".private_key", private_key, sizeof(private_key)) != sizeof(private_key)) {
-		fprintf(stderr, "Error loading private key from [%s]\n\nTry using --genkey first.\n\n", key_path);
+	if (loadFile(key_path, ".carbonpaper.key", private_key, sizeof(private_key)) != sizeof(private_key)) {
+		fprintf(stderr, "Error loading keys from [%s]\n\nTry using --genkey first.\n\n", key_path);
 		exit(1);
 	}
 
-	if (loadFile(key_path, ".public_key", public_key, sizeof(public_key)) != sizeof(public_key)) {
-		fprintf(stderr, "Error loading private key from [%s]\n\nTry using --genkey first.\n\n", key_path);
-		exit(1);
-	}
+	memcpy(public_key, private_key + sizeof(public_key), sizeof(public_key));
 
 	if (genLocalKey(local_private_key, local_public_key)) {
 		fprintf(stderr, "Error generating local key pair.\n\n", key_path);
