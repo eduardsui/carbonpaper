@@ -213,7 +213,7 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 	for (i = 0; i < clients; i ++) {
 		if (hosts[i].sock > 0)
 			sendData(loop, &hosts[i], hosts[i].sock, buffer, size, public_key, private_key, local_public_key, local_private_key, hosts[i].public_key, hash_table);
-
+		else
 		if (hosts[i].sock_accept > 0)
 			sendData(loop, &hosts[i], hosts[i].sock_accept, buffer, size, public_key, private_key, local_public_key, local_private_key, hosts[i].public_key, hash_table);
 	}
@@ -241,10 +241,53 @@ int deleteFileOrDirectoryNoEvent(int inotify_fd, const char *path_buf, khash_t(f
 	return err;
 }
 
+int mkFullDir(int inotify_fd, const char *filename_with_path, khash_t(fd_to_name) *hash_table) {
+	char full_path[MAX_PATH];
+
+	snprintf(full_path, MAX_PATH, "%s", filename_with_path);
+
+	char *dir = full_path;
+	char *name = dir;
+	// ignore last part (filename)
+	int last_err = 0;
+	while ((dir) && (dir[0])) {
+		char *dir_old = dir;
+		dir = strchr(dir, '/');
+		if (!dir)
+			dir = strchr(dir_old, '\\');
+		
+		if (!dir)
+			break;
+
+		dir[0] = 0;
+
+		last_err = mkdir(full_path, S_IRWXU);
+		if (!last_err) {
+			struct utimbuf times;
+			times.actime = 0;
+			times.modtime = 0;
+			utime(name, &times);
+
+			watch(inotify_fd, full_path, hash_table);
+		}
+
+		dir[0] = '/';
+		dir ++;
+	}
+	
+	return last_err;
+}
+
 int renameFileOrDirectoryNoEvent(int inotify_fd, const char *from, const char *to, khash_t(fd_to_name) *hash_table) {
 	if (rmdir(to))
 		unlink(to);
 	int err = rename(from, to);
+	if (err) {
+		mkFullDir(inotify_fd, to, hash_table);
+		err = rename(from, to);
+	}
+	if (err)
+		fprintf(stderr, "rename %s to %s error: %s\n", from, to, strerror(errno));
 	return err;
 }
 
@@ -254,7 +297,6 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 		perror("opendir");
 		return -1;
 	}
-	fprintf(stderr, "scanning [%s]\n", path);
 
 	char path_buf[MAX_PATH];
 	struct dirent *file;
@@ -306,8 +348,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 						fprintf(stdout, "created [%s], wd: %i\n", path_buf, wd);
 						scan_directory(inotify_fd, path_buf, hash_table);
 					}
-					// if ((event->mask & IN_ISDIR) || ((buf.st_mode & S_IFMT) == S_IFLNK))
-						notifyEvent(loop, path_buf, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
+					notifyEvent(loop, path_buf, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_DELETE) {
 					fprintf(stdout, "deleted [%s]\n", path_buf);
@@ -320,8 +361,10 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				} else
 				if (event->mask & IN_ATTRIB) {
 					fprintf(stdout, "attr [%s] changed\n", path_buf);
-					if (event->mask & IN_ISDIR)
+					if (event->mask & IN_ISDIR) {
 						watch(inotify_fd, path_buf, hash_table);
+						scan_directory(inotify_fd, path_buf, hash_table);
+					}
 					notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_MOVED_TO) {
@@ -416,6 +459,11 @@ int readFile(unsigned char *buf, int size, char *path) {
 
 int mkdirAuto(char *full_path, int mode, int inotify_fd, khash_t(fd_to_name) *hash_table) {
 	int err = mkdir(full_path, mode);
+	if (err) {
+		mkFullDir(inotify_fd, full_path, hash_table);
+		err = mkdir(full_path, mode);
+	}
+
 	if (!err)
 		watch(inotify_fd, full_path, hash_table);
 	return err;
@@ -490,7 +538,6 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 		lutimes(sync_file, times);
 
 		if (renameFileOrDirectoryNoEvent(inotify_fd, sync_file, full_path, hash_table)) {
-			perror("rename");
 			unlink(sync_file);
 			return -1;
 		}
@@ -528,7 +575,6 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 	utime(sync_file, &times);
 
 	if (renameFileOrDirectoryNoEvent(inotify_fd, sync_file, full_path, hash_table)) {
-		perror("rename");
 		unlink(sync_file);
 		return -1;
 	}
@@ -809,8 +855,9 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 								int sync = 0;
 								struct stat buf;
 								memset(&buf, 0, sizeof(buf));
+								int lstat_error = lstat(full_path, &buf);
 
-								if (lstat(full_path, &buf)) {
+								if (lstat_error) {
 									if (((mode & S_IFMT) != S_IFDIR) || (mkdirAuto(full_path, mode & ~S_IFMT, inotify_fd, hash_table)))
 										sync = 1;
 								} else {
@@ -830,10 +877,15 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 									}
 								}
 								if (event_type) {
-									fprintf(stderr, "event: %s\n", event_type);
 									if (strcmp(event_type, "deleted") == 0) {
 										deleteFileOrDirectoryNoEvent(inotify_fd, full_path, hash_table);
 										sync = 0;
+									} else
+									if (strcmp(event_type, "attr") == 0) {
+										if ((!lstat_error) && (buf.st_mtime == mtime) && (sync)) {
+											if ((mode != buf.st_mode) && (!chmod(full_path, mode & ~S_IFMT)))
+												sync = 0;
+										}
 									}
 								}
 
