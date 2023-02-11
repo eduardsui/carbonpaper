@@ -373,9 +373,9 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				} else
 				if (event->mask & IN_DELETE) {
 					fprintf(stdout, "deleted [%s]\n", path_buf);
-					if (event->mask & IN_ISDIR)
-						notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
-					else
+					// if (event->mask & IN_ISDIR)
+					// 	notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
+					// else
 					if (enable_file_delete) {
 						if (to_delete_files < DELETE_CACHE)
 							to_delete[to_delete_files ++] = strdup(path_buf);
