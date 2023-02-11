@@ -347,7 +347,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 		k = kh_get(fd_to_name, hash_table, event->wd);
 		if ((event->len) && (k != kh_end(hash_table) && (event->name[0] != '.'))) {
 			snprintf(path_buf, sizeof(path_buf), "%s/%s", kh_value(hash_table, k), event->name);
-			if (((!lstat(path_buf, &buf)) || (event->mask & IN_DELETE) || (event->mask & IN_MOVED_TO) || (event->mask & IN_MOVED_FROM)) && (((buf.st_mode & S_IFMT) == S_IFDIR) || ((buf.st_mode & S_IFMT) == S_IFREG) || ((buf.st_mode & S_IFMT) == S_IFLNK))) {
+			if (((!lstat(path_buf, &buf)) || (event->mask & IN_DELETE) || (event->mask & IN_MOVED_TO) || (event->mask & IN_MOVED_FROM))) {
 				// filename/dirname event->name
 
 				// check if delete operation is cached
