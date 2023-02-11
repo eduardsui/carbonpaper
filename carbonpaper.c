@@ -777,8 +777,6 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 									}
 								}
 
-if ((mode & S_IFMT) == S_IFLNK)
-	sync = 1;
 								switch (sync) {
 									case 1:
 										fprintf(stderr, "pull %s\n", path);
