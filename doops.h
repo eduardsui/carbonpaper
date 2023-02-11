@@ -470,6 +470,7 @@ static int loop_add_io_data(struct doops_loop *loop, int fd, int mode, void *use
     loop->fds = (struct pollfd *)DOOPS_REALLOC(loop->fds, sizeof(struct pollfd) * (loop->max_fd + 1));
     loop->fds[loop->max_fd].fd = fd;
     loop->fds[loop->max_fd].events = POLLIN | POLLPRI | POLLERR | POLLHUP | POLLNVAL;
+    loop->fds[loop->max_fd].revents = 0;
     if (mode) {
         loop->fds[loop->max_fd].events |= POLLOUT;
         // write-only
