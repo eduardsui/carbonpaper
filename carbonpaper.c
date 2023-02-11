@@ -53,6 +53,7 @@ static struct remote_client *hosts = NULL;
 static int clients = 0;
 static char *root_path = NULL;
 static int root_path_len = 0;
+static int enable_file_delete = 0;
 
 int addToBuffer(struct doops_loop *loop, struct remote_client *host, int socket, unsigned char *buffer, int len) {
 	if (!host)
@@ -355,6 +356,9 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				if (event->mask & IN_DELETE) {
 					fprintf(stdout, "deleted [%s]\n", path_buf);
 					if (event->mask & IN_ISDIR)
+						notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
+					else
+					if (enable_file_delete)
 						notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_CLOSE_WRITE) {
@@ -1057,11 +1061,15 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "--port: port number missing\n");
 				exit(1);
 			}
+		} else
+		if (strcmp(argv[i], "--enable-delete") == 0) {
+			enable_file_delete = 1;
+			path_index = i + 1;
 		}
 	}
 
 	if (path_index != argc - 1) {
-		fprintf(stderr, "Usage: %s [options] path_to_sync\n\nAvailable options:\n\t--keygen path\tgenerate new network key in path\n\t--keypath path\tuse network keys in given path (default is current path)\n\t--port\t\tuse TCP port (default 4804)\n\n", argv[0]);
+		fprintf(stderr, "Usage: %s [options] path_to_sync\n\nAvailable options:\n\t--keygen path\tgenerate new network key in path\n\t--keypath path\tuse network keys in given path (default is current path)\n\t--port\t\tuse TCP port (default 4804)\n\t--enable-delete\tenable file delete propagation [disabled by default]\n\n", argv[0]);
 		exit(1);
 	}
 
