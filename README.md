@@ -30,7 +30,7 @@ To compile, simply run:
 
 or
 
-``clang carbonpaper.c -o carbonpaper``
+``clang -fblocks carbonpaper.c -lBlocksRuntime -o carbonpaper``
 
 Note that it uses [doops](https://github.com/eduardsui/doops) event scheduler. It can be compiled with both gcc and clang.
 It currently works only on linux (heavily depends of [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html)).
