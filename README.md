@@ -24,7 +24,7 @@ Compiling
 
 To compile, simply run:
 
-``gcc carbonpaper.c -o carbonpaper``
+``gcc -O2 carbonpaper.c -o carbonpaper``
 
 or
 
