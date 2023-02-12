@@ -26,14 +26,25 @@
 #define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB  | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
 #define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB  | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
 
-#define EVENT_SIZE	(sizeof (struct inotify_event))
-#define EVENT_BUF_LEN	(1024 * (EVENT_SIZE + 16 ))
-#define DELETE_CACHE	1024
+#define EVENT_SIZE		(sizeof (struct inotify_event))
+#define EVENT_BUF_LEN		(1024 * (EVENT_SIZE + 16 ))
+#define INOTIFY_CACHE		EVENT_SIZE
 
-#define MAX_MESSAGE	0x8000000
-#define MAX_PATH	4096
+#define MAX_MESSAGE		0x48000000
+#define MAX_FILESIZE		MAX_MESSAGE - 0x400
+#define MAX_PATH		4096
+
+#define DEBUG_PRINT(f, ...)	fprintf(stderr, "%s [%i] ",timestamp(), __LINE__), fprintf(stderr, (f), ##__VA_ARGS__)				
+#define DEBUG_INFO(...)		fprintf(stderr, __VA_ARGS__)
 
 KHASH_MAP_INIT_INT(fd_to_name, char *)
+
+static char * timestamp() {
+    time_t now = time(NULL); 
+    char * time = asctime(gmtime(&now));
+    time[strlen(time)-1] = '\0';    // Remove \n
+    return time;
+}
 
 struct remote_client {
 	int sock;
@@ -130,7 +141,7 @@ void closeSocket(int sock) {
 		}
 	}
 	close(sock);
-	fprintf(stderr, "remove socket\n");
+	DEBUG_PRINT("remove socket\n");
 }
 
 int sharedSecret(unsigned char shared[32], unsigned char local_private_key[32], unsigned char remote_public_key[32]) {
@@ -184,7 +195,7 @@ int sendData(struct doops_loop *loop, struct remote_client *host, int socket, co
 	*(int *)buffer = htonl(msg_size - sizeof(int));
 
 	if (encryptSign(data, buffer + sizeof(int), len, local_private_key, remote_public_key, private_key, 0) <= 0) {
-		fprintf(stderr, "encryption error");
+		DEBUG_PRINT("encryption error");
 		free(buffer);
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
@@ -291,7 +302,7 @@ int renameFileOrDirectoryNoEvent(int inotify_fd, const char *from, const char *t
 		err = rename(from, to);
 	}
 	if (err)
-		fprintf(stderr, "rename %s to %s error: %s\n", from, to, strerror(errno));
+		DEBUG_PRINT("rename %s to %s error: %s\n", from, to, strerror(errno));
 	return err;
 }
 
@@ -323,10 +334,48 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 				watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 				scan_directory(inotify_fd, path_buf, hash_table);
 			} else
+			if (buf.st_size <= MAX_FILESIZE)
 				watch(inotify_fd, path_buf, hash_table, INOTIFY_FILE_FLAGS);
 		}
 	}
 	closedir(dir);
+	return 0;
+}
+
+void clearCache(char **to_delete, int *to_delete_files, const char *path_buf) {
+	for (int i = 0; i < *to_delete_files; i ++) {
+		if (!strcmp(to_delete[i], path_buf)) {
+			DEBUG_PRINT("clear cache [%s]\n", path_buf);
+			free(to_delete[i]);
+			for (int j = i; j < *to_delete_files - 1; j ++)
+				to_delete[j] = to_delete[j + 1];
+			to_delete[*to_delete_files] = 0;
+			(*to_delete_files) --;
+			i --;
+		}
+	}
+}
+
+void notifyCache(struct doops_loop *loop, char **to_delete, int *to_delete_files, const char *method, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
+	for (int i = 0; i < *to_delete_files; i ++) {
+		DEBUG_PRINT("%s cache: %s\n", method, to_delete[i]);
+		if (to_delete[i]) {
+			notifyEvent(loop, to_delete[i], method, public_key, private_key, local_public_key, local_private_key, hash_table);
+			free(to_delete[i]);
+			to_delete[i] = 0;
+		}
+	}
+	*to_delete_files = 0;
+}
+
+int addCache(char **to_delete, int *to_delete_files, int limit, const char *path_buf) {
+	clearCache(to_delete, to_delete_files, path_buf);
+
+	if (*to_delete_files < limit) {
+		to_delete[(*to_delete_files) ++] = strdup(path_buf);
+		return 1;
+	}
+
 	return 0;
 }
 
@@ -340,8 +389,11 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 	int i = 0;
 	khint_t k;
 
-	char *to_delete[DELETE_CACHE];
+	char *to_delete[INOTIFY_CACHE];
 	int to_delete_files = 0;
+
+	char *to_sync[INOTIFY_CACHE];
+	int to_sync_files = 0;
 
 	while (i < length) {
 		struct inotify_event *event = (struct inotify_event *)&events[i];
@@ -352,69 +404,65 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				// filename/dirname event->name
 
 				// check if delete operation is cached
-				for (int i = 0; i < to_delete_files; i ++) {
-					if (!strcmp(to_delete[i], path_buf)) {
-						fprintf(stderr, "reject delete - file recreated [%s]\n", path_buf);
-						free(to_delete[i]);
-						for (int j = i; j < to_delete_files - 1; j ++)
-							to_delete[j] = to_delete[j + 1];
-						to_delete[to_delete_files] = 0;
-						to_delete_files --;
-						i --;
-					}
-				}
+				clearCache(to_delete, &to_delete_files, path_buf);
 
 				if (event->mask & IN_CREATE) {
 					if (event->mask & IN_ISDIR) {
-						int wd = watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
-						fprintf(stdout, "created [%s], wd: %i\n", path_buf, wd);
+						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
+						DEBUG_PRINT("created [%s]\n", path_buf);
 						scan_directory(inotify_fd, path_buf, hash_table);
+					} else
+					if (buf.st_size > MAX_FILESIZE) {
+						DEBUG_PRINT("file too big [%s]\n", path_buf);
+						continue;
 					}
 					notifyEvent(loop, path_buf, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_DELETE) {
-					fprintf(stdout, "deleted [%s]\n", path_buf);
-					// if (event->mask & IN_ISDIR)
-					// 	notifyEvent(loop, path_buf, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
-					// else
+					DEBUG_PRINT("deleted [%s]\n", path_buf);
 					if (enable_file_delete) {
-						if (to_delete_files < DELETE_CACHE)
+						if (to_delete_files < INOTIFY_CACHE)
 							to_delete[to_delete_files ++] = strdup(path_buf);
 					}
 				} else
 				if (event->mask & IN_CLOSE_WRITE) {
-					fprintf(stdout, "written [%s]\n", path_buf);
-					notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
+					DEBUG_PRINT("written [%s]\n", path_buf);
+					if (buf.st_size > MAX_FILESIZE) {
+						DEBUG_PRINT("file too big [%s]\n", path_buf);
+						continue;
+					}
+					if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+						notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_ATTRIB) {
-					fprintf(stdout, "attr [%s] changed\n", path_buf);
+					DEBUG_PRINT("attr [%s] changed\n", path_buf);
 					if (event->mask & IN_ISDIR) {
 						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 						scan_directory(inotify_fd, path_buf, hash_table);
 					}
-					notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
+					if (buf.st_size > MAX_FILESIZE) {
+						DEBUG_PRINT("file too big [%s]\n", path_buf);
+						continue;
+					}
+
+					if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+						notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_MOVED_TO) {
-					fprintf(stdout, "moved to [%s]\n", path_buf);
+					DEBUG_PRINT("moved to [%s]\n", path_buf);
 					if (event->mask & IN_ISDIR) {
 						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 						scan_directory(inotify_fd, path_buf, hash_table);
 					}
-					notifyEvent(loop, path_buf, "move", public_key, private_key, local_public_key, local_private_key, hash_table);
+					if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+						notifyEvent(loop, path_buf, "move", public_key, private_key, local_public_key, local_private_key, hash_table);
 				}
 			}
 		}
 		i += EVENT_SIZE + event->len;
 	}
-	for (int i = 0; i < to_delete_files; i ++) {
-		fprintf(stderr, "deleting cache: %s\n", to_delete[i]);
-		if (to_delete[i]) {
-			notifyEvent(loop, to_delete[i], "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
-			free(to_delete[i]);
-			to_delete[i] = 0;
-		}
-	}
-	to_delete_files = 0;
+	notifyCache(loop, to_delete, &to_delete_files, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
+	notifyCache(loop, to_sync, &to_sync_files, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
 
 	return 0;
 }
@@ -542,7 +590,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 
 	struct stat buf;
 	if ((!lstat(path, &buf)) && (buf.st_mtime > mtime) && (buf.st_mode == mode)) {
-		fprintf(stderr, "local file is newer %s (%u > %u)\n",  full_path, (unsigned int)buf.st_mtime, (unsigned int)mtime);
+		DEBUG_PRINT("local file is newer %s (%u > %u)\n",  full_path, (unsigned int)buf.st_mtime, (unsigned int)mtime);
 		return 0;
 	}
 
@@ -662,7 +710,7 @@ unsigned char *readFileAuto(char *path, int *size) {
 	*size = lseek(fd, 0, SEEK_END);
 	lseek(fd, 0, SEEK_SET);
 
-	if ((*size >= 0) && (*size <= MAX_MESSAGE - 0x400)) {
+	if ((*size >= 0) && (*size <= MAX_FILESIZE)) {
 		buffer = (unsigned char *)malloc(*size + 4096);
 		if (buffer) {
 			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u.%u:%o:%s\n", (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
@@ -715,7 +763,7 @@ int genKey(const char *path) {
 	if (writeFile(private_key, sizeof(private_key), full_path))
 		return -1;
 
-	fprintf(stdout, "generated key pair in [%s]\n", path);
+	fprintf(stderr, "generated key pair in [%s]\n", path);
 	return 0;
 }
 
@@ -741,7 +789,7 @@ int genLocalKey(unsigned char private_key[32], unsigned char public_key[32]) {
 	crypto_blake2b(private_key, 32, temp, 32);
 	crypto_x25519_public_key(public_key, private_key);
 
-	fprintf(stdout, "generated local key pair\n");
+	fprintf(stderr, "generated local key pair\n");
 	return 0;
 }
 
@@ -761,7 +809,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	ssize_t recv_size = recv(socket, &msg_size, sizeof(msg_size), MSG_NOSIGNAL);
 	struct remote_client *host = findHost(socket);
 	if ((recv_size <= 0) || (!host)) {
-		fprintf(stderr, "cannot identify host\n");
+		DEBUG_PRINT("cannot identify host\n");
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
 		return -1;
@@ -775,11 +823,11 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 			closeSocket(socket);
 			return -1;
 		}
-		fprintf(stderr, "received host public key\n");
+		DEBUG_PRINT("received host public key\n");
 		return sendData(loop, host, socket, (const unsigned char *)"SYNC", 4, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table);
 	}
 	if (msg_size >= MAX_MESSAGE) {
-		fprintf(stderr, "message too big\n");
+		DEBUG_PRINT("message too big\n");
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
 		return -1;
@@ -817,7 +865,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	if (size <= 0) {
 		free(pt);
 		free(buffer);
-		fprintf(stderr, "signature verify failed\n");
+		DEBUG_PRINT("signature verify failed\n");
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
 		return -1;
@@ -844,7 +892,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 				unsigned char *file_data = readFileAuto(full_path, &fsize);
 				if ((file_data) && (fsize > 0)) {
 					if (sendData(loop, host, socket, file_data, fsize, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0)
-						fprintf(stderr, "send error\n");
+						DEBUG_PRINT("send error\n");
 				}
 				free(file_data);
 			} else
@@ -898,6 +946,14 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 								memset(&buf, 0, sizeof(buf));
 								int lstat_error = lstat(full_path, &buf);
 
+								int file_size = 0;
+								char *ref = strchr(line, '.');
+								if ((ref) && (ref[0])) {
+									// check size
+									file_size = atoi(ref + 1);
+								}
+
+
 								if (lstat_error) {
 									if (((mode & S_IFMT) != S_IFDIR) || (mkdirAuto(full_path, mode & ~S_IFMT, inotify_fd, hash_table)))
 										sync = 1;
@@ -907,13 +963,9 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 									} else
 									if (buf.st_mtime > mtime) {
 										sync = 2;
-									} else {
-										char *ref = strchr(line, '.');
-										if ((ref) && (ref[0])) {
-											// check size
-											if (buf.st_size < atoi(ref + 1))
-												sync = 1;
-										}
+									} else
+									if (buf.st_size < file_size) {
+										sync = 1;
 									}
 
 
@@ -933,7 +985,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 									} else
 									if (strcmp(event_type, "attr") == 0) {
 										if ((!lstat_error) && (buf.st_mtime == mtime) && (sync)) {
-											if ((mode != buf.st_mode) && (!chmod(full_path, mode & ~S_IFMT)))
+											if ((mode != buf.st_mode) && (buf.st_size == file_size) && (!chmod(full_path, mode & ~S_IFMT)))
 												sync = 0;
 										}
 									}
@@ -941,10 +993,10 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 
 								switch (sync) {
 									case 1:
-										fprintf(stderr, "pull %s\n", path);
+										DEBUG_PRINT("pull %s\n", path);
 										snprintf(request_data, sizeof(request_data), "PULL\n%s", path);
 										if (sendData(loop, host, socket, (const unsigned char *)request_data, strlen(request_data), public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0) {
-											fprintf(stderr, "send error\n");
+											DEBUG_PRINT("send error\n");
 											list = NULL;
 										}
 										break;
@@ -1009,7 +1061,7 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 
 	if (connect(host->sock, (struct sockaddr *)&host->servaddr, sizeof(host->servaddr))) {
 		perror("connect");
-		fprintf(stderr, "error connecting to %s:%i\n", host->hostname, host->port);
+		DEBUG_PRINT("error connecting to %s:%i\n", host->hostname, host->port);
 		close(host->sock);
 		host->sock = 0;
 		return -1;
@@ -1019,7 +1071,7 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 	addToBuffer(loop, host, host->sock, (unsigned char *)&size, sizeof(int));
 	addToBuffer(loop, host, host->sock, local_public_key, 32);
 
-	fprintf(stdout, "connected to %s:%i\n", host->hostname, host->port);
+	DEBUG_INFO("connected to %s:%i\n", host->hostname, host->port);
 
 	loop_add_io_data(loop, host->sock, DOOPS_READWRITE, host);
 
@@ -1096,7 +1148,7 @@ int main(int argc, char **argv) {
 				if (!hosts[clients].port)
 					hosts[clients].port = 4804;
 
-				fprintf(stdout, "added host %s:%i\n", hosts[clients].hostname, hosts[clients].port);
+				fprintf(stderr, "added host %s:%i\n", hosts[clients].hostname, hosts[clients].port);
 				clients ++;
 				path_index = i + 1;
 			} else {
@@ -1111,7 +1163,7 @@ int main(int argc, char **argv) {
 	}
 
 	if (path_index != argc - 1) {
-		fprintf(stderr, "Usage: %s [options] path_to_sync\n\nAvailable options:\n\t--genkey path\tgenerate new network key in path\n\t--keypath path\tuse network keys in given path (default is current path)\n\t--port\t\tuse TCP port (default 4804)\n\t--enable-delete\tenable file delete propagation [disabled by default]\n\n", argv[0]);
+		fprintf(stderr, "Usage: %s [options] path_to_sync\n\nAvailable options:\n\t--genkey path\t\tgenerate new network key in path\n\t--keypath path\t\tuse network keys in given path (default is current path)\n\t--port    \t\tlisten on TCP port (default 4804)\n\t--host hostaddr[:port]\tconnect to client at hostaddr(ip)\n\t--enable-delete\t\tenable file delete propagation [disabled by default]\n\n", argv[0]);
 		exit(1);
 	}
 
@@ -1282,7 +1334,7 @@ int main(int argc, char **argv) {
 			} else {
 				void *host_data = validHost(loop, &client_addr, sock, local_public_key);
 				if (host_data) {
-					fprintf(stdout, "accepted connection request\n");
+					DEBUG_INFO("accepted connection request\n");
 					struct timeval tv;
 					tv.tv_sec = 1;
 					tv.tv_usec = 0;
@@ -1290,7 +1342,7 @@ int main(int argc, char **argv) {
 					setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 					loop_add_io_data(loop, sock, DOOPS_READWRITE, host_data);
 				} else {
-					fprintf(stderr, "connection request from invalid address\n");
+					DEBUG_PRINT("connection request from invalid address\n");
 					close(sock);
 				}
 			}
