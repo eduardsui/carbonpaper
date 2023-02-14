@@ -431,8 +431,10 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 						DEBUG_PRINT("file too big [%s]\n", path_buf);
 						continue;
 					}
-					if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
-						notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
+					clearCache(to_sync, &to_sync_files, path_buf);
+					// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+
+					notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_ATTRIB) {
 					DEBUG_PRINT("attr [%s] changed\n", path_buf);
@@ -554,7 +556,7 @@ int mkdirAuto(char *full_path, mode_t mode, int inotify_fd, khash_t(fd_to_name) 
 	return err;
 }
 
-int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_name) *hash_table) {
+int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_name) *hash_table, int replace) {
 	char full_path[MAX_PATH];
 	static unsigned int file_write_index = 0;
 
@@ -589,7 +591,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 	snprintf(full_path, sizeof(full_path), "%s/%s", root_path, path);
 
 	struct stat buf;
-	if ((!lstat(path, &buf)) && (buf.st_mtime > mtime) && (buf.st_mode == mode)) {
+	if ((!replace) && (!lstat(path, &buf)) && (buf.st_mtime > mtime) && (buf.st_mode == mode)) {
 		DEBUG_PRINT("local file is newer %s (%u > %u)\n",  full_path, (unsigned int)buf.st_mtime, (unsigned int)mtime);
 		return 0;
 	}
@@ -671,7 +673,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 	return 0;
 }
 
-unsigned char *readFileAuto(char *path, int *size) {
+unsigned char *readFileAuto(char *path, int *size, const char *method) {
 	unsigned char *buffer = NULL;
 
 	*size = -1;
@@ -686,7 +688,7 @@ unsigned char *readFileAuto(char *path, int *size) {
 		*size = MAX_PATH + 4096;
 		buffer = (unsigned char *)malloc(*size);
 		if (buffer) {
-			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u.%u:%o:%s\n", (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
+			int bytes_read = snprintf((char *)buffer, 4096, "%s\n%u.%u:%o:%s\n", method, (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
 			int link_buf = readlink(path, (char *)buffer + bytes_read, *size - bytes_read);
 			if (link_buf < 0) {
 				perror("readlink");
@@ -889,7 +891,17 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 			if (memcmp(pt, "PULL", 4) == 0) {
 				snprintf(full_path, sizeof(full_path), "%s/%s", root_path, pt + 5);
 				int fsize = -1;
-				unsigned char *file_data = readFileAuto(full_path, &fsize);
+				unsigned char *file_data = readFileAuto(full_path, &fsize, "DATA");
+				if ((file_data) && (fsize > 0)) {
+					if (sendData(loop, host, socket, file_data, fsize, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0)
+						DEBUG_PRINT("send error\n");
+				}
+				free(file_data);
+			} else
+			if (memcmp(pt, "UPDT", 4) == 0) {
+				snprintf(full_path, sizeof(full_path), "%s/%s", root_path, pt + 5);
+				int fsize = -1;
+				unsigned char *file_data = readFileAuto(full_path, &fsize, "FILE");
 				if ((file_data) && (fsize > 0)) {
 					if (sendData(loop, host, socket, file_data, fsize, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0)
 						DEBUG_PRINT("send error\n");
@@ -897,7 +909,10 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 				free(file_data);
 			} else
 			if (memcmp(pt, "DATA", 4) == 0) {
-				writeFileAuto(pt + 5, size - 5, inotify_fd, hash_table);
+				writeFileAuto(pt + 5, size - 5, inotify_fd, hash_table, 0);
+			} else
+			if (memcmp(pt, "FILE", 4) == 0) {
+				writeFileAuto(pt + 5, size - 5, inotify_fd, hash_table, 1);
 			} else
 			if ((memcmp(pt, "LIST", 4) == 0) || (is_desc)) {
 				char *list = (char *)pt + 5;
@@ -988,13 +1003,22 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 											if ((mode != buf.st_mode) && (buf.st_size == file_size) && (!chmod(full_path, mode & ~S_IFMT)))
 												sync = 0;
 										}
+									} else
+									if (strcmp(event_type, "write") == 0) {
+										sync = 4;
 									}
 								}
 
 								switch (sync) {
 									case 1:
-										DEBUG_PRINT("pull %s\n", path);
-										snprintf(request_data, sizeof(request_data), "PULL\n%s", path);
+									case 4:
+										if (sync == 4) {
+											DEBUG_PRINT("pull %s\n", path);
+											snprintf(request_data, sizeof(request_data), "UPDT\n%s", path);
+										} else {
+											DEBUG_PRINT("update %s\n", path);
+											snprintf(request_data, sizeof(request_data), "PULL\n%s", path);
+										}
 										if (sendData(loop, host, socket, (const unsigned char *)request_data, strlen(request_data), public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0) {
 											DEBUG_PRINT("send error\n");
 											list = NULL;
