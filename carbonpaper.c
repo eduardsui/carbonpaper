@@ -38,6 +38,7 @@
 #define DEBUG_INFO(...)		fprintf(stderr, __VA_ARGS__)
 
 KHASH_MAP_INIT_INT(fd_to_name, char *)
+KHASH_MAP_INIT_INT64(inotify_ignore, time_t)
 
 static char * timestamp() {
     time_t now = time(NULL); 
@@ -67,6 +68,34 @@ static int clients = 0;
 static char *root_path = NULL;
 static int root_path_len = 0;
 static int enable_file_delete = 0;
+static khash_t(inotify_ignore) *ignore_io = NULL;
+
+void add_skip_event(const char *full_path) {
+	struct stat buf;
+	if (lstat(full_path, &buf))
+		return;
+
+	int absent;
+	khint_t k = kh_put(inotify_ignore, ignore_io, buf.st_ino, &absent);
+	kh_value(ignore_io, k) = time(NULL);
+}
+
+int remove_skip_event(const char *full_path) {
+	struct stat buf;
+	if (lstat(full_path, &buf))
+		return 0;
+
+	khint_t k = kh_get(inotify_ignore, ignore_io, buf.st_ino);
+	if ((k != kh_end(ignore_io)) && (kh_exist(ignore_io, k))) {
+		time_t val = kh_value(ignore_io, k);
+		kh_del(inotify_ignore, ignore_io, k); 
+		// over 10 seconds
+		if (time(NULL) - val >= 10)
+			return 0;
+		return 1;
+	}
+	return 0;
+}
 
 int addToBuffer(struct doops_loop *loop, struct remote_client *host, int socket, unsigned char *buffer, int len) {
 	if (!host)
@@ -414,6 +443,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 					} else
 					if (buf.st_size > MAX_FILESIZE) {
 						DEBUG_PRINT("file too big [%s]\n", path_buf);
+						i += EVENT_SIZE + event->len;
 						continue;
 					}
 					notifyEvent(loop, path_buf, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
@@ -427,14 +457,19 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				} else
 				if (event->mask & IN_CLOSE_WRITE) {
 					DEBUG_PRINT("written [%s]\n", path_buf);
-					if (buf.st_size > MAX_FILESIZE) {
-						DEBUG_PRINT("file too big [%s]\n", path_buf);
+					if (remove_skip_event(path_buf)) {
+						i += EVENT_SIZE + event->len;
 						continue;
+					} else {
+						if (buf.st_size > MAX_FILESIZE) {
+							DEBUG_PRINT("file too big [%s]\n", path_buf);
+							i += EVENT_SIZE + event->len;
+							continue;
+						}
+						clearCache(to_sync, &to_sync_files, path_buf);
+						// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+						notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
 					}
-					clearCache(to_sync, &to_sync_files, path_buf);
-					// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
-
-					notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_ATTRIB) {
 					DEBUG_PRINT("attr [%s] changed\n", path_buf);
@@ -444,6 +479,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 					}
 					if (buf.st_size > MAX_FILESIZE) {
 						DEBUG_PRINT("file too big [%s]\n", path_buf);
+						i += EVENT_SIZE + event->len;
 						continue;
 					}
 
@@ -629,6 +665,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 			return -1;
 		}
 
+		add_skip_event(full_path);
 		return 0;
 	} else {
 		int fd = open(sync_file, O_WRONLY | O_CREAT | O_TRUNC, mode);
@@ -669,6 +706,8 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 	}
 
 	watch(inotify_fd, full_path, hash_table, INOTIFY_FILE_FLAGS);
+
+	add_skip_event(full_path);
 
 	return 0;
 }
@@ -867,7 +906,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	if (size <= 0) {
 		free(pt);
 		free(buffer);
-		DEBUG_PRINT("signature verify failed\n");
+		DEBUG_PRINT("signature verify failed %s\n", pt);
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
 		return -1;
@@ -1248,6 +1287,7 @@ int main(int argc, char **argv) {
 	}
 
 	hash_table = kh_init(fd_to_name);
+	ignore_io = kh_init(inotify_ignore);
 
 	scan_directory(fd, argv[path_index], hash_table);
 
@@ -1306,6 +1346,7 @@ int main(int argc, char **argv) {
 				return;
 			}
 			if (sent > 0) {
+				host->timestamp = time(NULL);
 				if (sent == host->write_buffer_len) {
 					free(host->write_buffer);
 					host->write_buffer = NULL;
@@ -1390,7 +1431,9 @@ int main(int argc, char **argv) {
 
 	free(hosts);
 
+	kh_destroy(inotify_ignore, ignore_io);
 	kh_destroy(fd_to_name, hash_table);
+
 	hash_table = NULL;
 
    	close(fd);
