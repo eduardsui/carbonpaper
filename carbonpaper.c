@@ -498,9 +498,9 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 							continue;
 						}
 						add_skip_event(path_buf);
+						// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+							notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
 					}
-					// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
-						notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_MOVED_TO) {
 					// remove_skip_event(path_buf);
