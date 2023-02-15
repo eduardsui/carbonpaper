@@ -23,8 +23,8 @@
 #include "doops.h"
 #include "monocypher.c"
 
-#define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB  | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
-#define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB  | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+#define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+#define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
 
 #define EVENT_SIZE		(sizeof (struct inotify_event))
 #define EVENT_BUF_LEN		(1024 * (EVENT_SIZE + 16 ))
@@ -38,7 +38,7 @@
 #define DEBUG_INFO(...)		fprintf(stderr, __VA_ARGS__)
 
 KHASH_MAP_INIT_INT(fd_to_name, char *)
-KHASH_MAP_INIT_INT64(inotify_ignore, time_t)
+KHASH_MAP_INIT_INT64(inotify_ignore, unsigned int)
 
 static char * timestamp() {
     time_t now = time(NULL); 
@@ -77,7 +77,21 @@ void add_skip_event(const char *full_path) {
 
 	int absent;
 	khint_t k = kh_put(inotify_ignore, ignore_io, buf.st_ino, &absent);
-	kh_value(ignore_io, k) = time(NULL);
+	kh_value(ignore_io, k) = buf.st_mtime;
+}
+
+int skip_event(const char *full_path) {
+	struct stat buf;
+	if (lstat(full_path, &buf))
+		return 1;
+
+	khint_t k = kh_get(inotify_ignore, ignore_io, buf.st_ino);
+	if ((k != kh_end(ignore_io)) && (kh_exist(ignore_io, k))) {
+		if (kh_value(ignore_io, k) == buf.st_mtime)
+			return 1;
+		return 0;
+	}
+	return 1;
 }
 
 int remove_skip_event(const char *full_path) {
@@ -87,11 +101,7 @@ int remove_skip_event(const char *full_path) {
 
 	khint_t k = kh_get(inotify_ignore, ignore_io, buf.st_ino);
 	if ((k != kh_end(ignore_io)) && (kh_exist(ignore_io, k))) {
-		time_t val = kh_value(ignore_io, k);
 		kh_del(inotify_ignore, ignore_io, k); 
-		// over 10 seconds
-		if (time(NULL) - val >= 10)
-			return 0;
 		return 1;
 	}
 	return 0;
@@ -440,16 +450,19 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 						DEBUG_PRINT("created [%s]\n", path_buf);
 						scan_directory(inotify_fd, path_buf, hash_table);
-					} else
-					if (buf.st_size > MAX_FILESIZE) {
-						DEBUG_PRINT("file too big [%s]\n", path_buf);
-						i += EVENT_SIZE + event->len;
-						continue;
+						notifyEvent(loop, path_buf, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
+					} else {
+						if (buf.st_size > MAX_FILESIZE) {
+							DEBUG_PRINT("file too big [%s]\n", path_buf);
+							i += EVENT_SIZE + event->len;
+							continue;
+						}
+						add_skip_event(path_buf);
 					}
-					notifyEvent(loop, path_buf, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_DELETE) {
 					DEBUG_PRINT("deleted [%s]\n", path_buf);
+					remove_skip_event(path_buf);
 					if (enable_file_delete) {
 						if (to_delete_files < INOTIFY_CACHE)
 							to_delete[to_delete_files ++] = strdup(path_buf);
@@ -457,42 +470,48 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 				} else
 				if (event->mask & IN_CLOSE_WRITE) {
 					DEBUG_PRINT("written [%s]\n", path_buf);
-					if (remove_skip_event(path_buf)) {
+					// remove_skip_event(path_buf);
+
+					if (buf.st_size > MAX_FILESIZE) {
+						DEBUG_PRINT("file too big [%s]\n", path_buf);
 						i += EVENT_SIZE + event->len;
 						continue;
+					}
+					clearCache(to_sync, &to_sync_files, path_buf);
+					// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+					notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
+				} else
+				if (event->mask & IN_ATTRIB) {
+					DEBUG_PRINT("attr [%s] changed\n", path_buf);
+					if (skip_event(path_buf)) {
+						i += EVENT_SIZE + event->len;
+						continue;
+					}
+
+					if (event->mask & IN_ISDIR) {
+						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
+						scan_directory(inotify_fd, path_buf, hash_table);
 					} else {
 						if (buf.st_size > MAX_FILESIZE) {
 							DEBUG_PRINT("file too big [%s]\n", path_buf);
 							i += EVENT_SIZE + event->len;
 							continue;
 						}
-						clearCache(to_sync, &to_sync_files, path_buf);
-						// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
-						notifyEvent(loop, path_buf, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
+						add_skip_event(path_buf);
 					}
-				} else
-				if (event->mask & IN_ATTRIB) {
-					DEBUG_PRINT("attr [%s] changed\n", path_buf);
-					if (event->mask & IN_ISDIR) {
-						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
-						scan_directory(inotify_fd, path_buf, hash_table);
-					}
-					if (buf.st_size > MAX_FILESIZE) {
-						DEBUG_PRINT("file too big [%s]\n", path_buf);
-						i += EVENT_SIZE + event->len;
-						continue;
-					}
-
-					if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+					// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
 						notifyEvent(loop, path_buf, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
 				} else
 				if (event->mask & IN_MOVED_TO) {
+					// remove_skip_event(path_buf);
 					DEBUG_PRINT("moved to [%s]\n", path_buf);
 					if (event->mask & IN_ISDIR) {
 						watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 						scan_directory(inotify_fd, path_buf, hash_table);
+					} else {
+						add_skip_event(path_buf);
 					}
-					if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
+					// if (!addCache(to_sync, &to_sync_files, INOTIFY_CACHE, path_buf))
 						notifyEvent(loop, path_buf, "move", public_key, private_key, local_public_key, local_private_key, hash_table);
 				}
 			}
@@ -500,7 +519,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 		i += EVENT_SIZE + event->len;
 	}
 	notifyCache(loop, to_delete, &to_delete_files, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
-	notifyCache(loop, to_sync, &to_sync_files, "attr", public_key, private_key, local_public_key, local_private_key, hash_table);
+	// notifyCache(loop, to_sync, &to_sync_files, "move", public_key, private_key, local_public_key, local_private_key, hash_table);
 
 	return 0;
 }
@@ -906,7 +925,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	if (size <= 0) {
 		free(pt);
 		free(buffer);
-		DEBUG_PRINT("signature verify failed %s\n", pt);
+		DEBUG_PRINT("signature verify failed\n");
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
 		return -1;
@@ -932,6 +951,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 				int fsize = -1;
 				unsigned char *file_data = readFileAuto(full_path, &fsize, "DATA");
 				if ((file_data) && (fsize > 0)) {
+					DEBUG_PRINT("pull request %s\n", pt + 5);
 					if (sendData(loop, host, socket, file_data, fsize, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0)
 						DEBUG_PRINT("send error\n");
 				}
@@ -942,6 +962,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 				int fsize = -1;
 				unsigned char *file_data = readFileAuto(full_path, &fsize, "FILE");
 				if ((file_data) && (fsize > 0)) {
+					DEBUG_PRINT("full file sync %s\n", pt + 5);
 					if (sendData(loop, host, socket, file_data, fsize, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0)
 						DEBUG_PRINT("send error\n");
 				}
@@ -1038,9 +1059,33 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 										sync = 0;
 									} else
 									if (strcmp(event_type, "attr") == 0) {
-										if ((!lstat_error) && (buf.st_mtime == mtime) && (sync)) {
-											if ((mode != buf.st_mode) && (buf.st_size == file_size) && (!chmod(full_path, mode & ~S_IFMT)))
+										if (!lstat_error) {
+											if (is_desc) {
+												chmod(full_path, mode & ~S_IFMT);
+												if (buf.st_mtime != mtime) {
+													struct timeval times[2];
+													times[0].tv_sec = mtime;
+													times[0].tv_usec = 0;
+													times[1].tv_sec = mtime;
+													times[1].tv_usec = 0;
+
+													DEBUG_PRINT("change mtime %s %i => %i\n", full_path, buf.st_mtime, mtime);
+													if (!lutimes(full_path, times))
+														add_skip_event(full_path);
+												}
+												if (mode != buf.st_mode) {
+													DEBUG_PRINT("change mode %s %o => %o\n", full_path, buf.st_mode, mode);
+													if (!chmod(full_path, mode & ~S_IFMT))
+														add_skip_event(full_path);
+												}
 												sync = 0;
+											} else
+											if ((buf.st_mtime == mtime) && (sync)) {
+												if ((mode != buf.st_mode) && (buf.st_size == file_size) && (!chmod(full_path, mode & ~S_IFMT))) {
+													add_skip_event(full_path);
+													sync = 0;
+												}
+											}
 										}
 									} else
 									if (strcmp(event_type, "write") == 0) {
@@ -1052,10 +1097,10 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 									case 1:
 									case 4:
 										if (sync == 4) {
-											DEBUG_PRINT("pull %s\n", path);
+											DEBUG_PRINT("update %s\n", path);
 											snprintf(request_data, sizeof(request_data), "UPDT\n%s", path);
 										} else {
-											DEBUG_PRINT("update %s\n", path);
+											DEBUG_PRINT("pull %s\n", path);
 											snprintf(request_data, sizeof(request_data), "PULL\n%s", path);
 										}
 										if (sendData(loop, host, socket, (const unsigned char *)request_data, strlen(request_data), public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table) <= 0) {
@@ -1309,7 +1354,7 @@ int main(int argc, char **argv) {
 		loop_schedule(&loop, {
 			int i;
 			for (i = 0; i < clients; i ++) {
-				if ((!hosts[i].sock) || (time(NULL) - hosts[i].timestamp >= 48)) {
+				if ((!hosts[i].sock) || (time(NULL) - hosts[i].timestamp >= 480)) {
 					client_connect(loop, &hosts[i], local_public_key);
 				} else {
 					if (hosts[i].sock)
