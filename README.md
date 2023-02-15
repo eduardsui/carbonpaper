@@ -16,7 +16,7 @@ Main features:
 
 Disadvantages:
 - atomic write/reads (entire file is synchronized at once - no partial updates)
-- default file size limit is 1.2Gb (files greater than 1.2Gb will not be synchronized)
+- default file size limit is 1.2Gb (files larger than 1.2Gb will not be synchronized)
 
 
 Compiling
