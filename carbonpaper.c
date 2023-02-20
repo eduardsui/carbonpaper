@@ -19,8 +19,8 @@
 	#include <wincrypt.h>
 	#include <sys/utime.h>
 
-	#define socklen_t			int
-	#define lstat				stat
+	#define socklen_t		int
+	#define lstat			stat
 	#define MSG_NOSIGNAL		0
 	#define NO_INOTIFY
 
@@ -38,7 +38,7 @@
 
 	#undef MAX_PATH
 
-    #define open(path, oflag , pmode)   _open(path, oflag | O_BINARY, 0);
+	#define open(path, oflag , pmode)   _open(path, oflag | O_BINARY, 0);
 #else
 	#include <netdb.h>
 	#include <netinet/in.h>
