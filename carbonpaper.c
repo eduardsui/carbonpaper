@@ -1,15 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/file.h>
-#include <sys/inotify.h>
 #include <sys/stat.h>
-#include <sys/socket.h>
-#include <sys/time.h>
 #include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -18,13 +12,48 @@
 #include <time.h>
 #include <utime.h>
 
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <winsock2.h>
+    #include <windows.h>
+    #include <sys/utime.h>
+
+    #define socklen_t           int
+    #define lstat               stat
+    #define MSG_NOSIGNAL        0
+    #define NO_INOTIFY
+
+    #define WITH_SELECT
+
+    #define INOTIFY_FLAGS       0
+    #define INOTIFY_FILE_FLAGS  0
+
+    static int lutimes(const char *sync_file, struct timeval times[2]) {
+        struct _utimbuf time_buf;
+        time_buf.actime = times[0].tv_sec;
+        time_buf.modtime = times[1].tv_sec;
+        return _utime(sync_file, &time_buf);
+    }
+
+    #undef MAX_PATH
+#else
+    #include <netdb.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <sys/inotify.h>
+    #include <sys/socket.h>
+    #include <sys/time.h>
+
+    #define WITH_POLL
+
+    #define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+    #define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+#endif
+
 #include "khash.h"
-#define WITH_POLL
 #include "doops.h"
 #include "monocypher.c"
 
-#define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
-#define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
 
 #define EVENT_SIZE		(sizeof (struct inotify_event))
 #define EVENT_BUF_LEN		(1024 * (EVENT_SIZE + 16 ))
@@ -163,7 +192,8 @@ void closeSocket(int sock) {
 	if (sock <= 0)
 		return;
 
-	for (int i = 0; i < clients; i ++) {
+    int i;
+	for (i = 0; i < clients; i ++) {
 		if (hosts[i].sock == sock) {
 			hosts[i].sock = 0;
 			free(hosts[i].write_buffer);
@@ -275,6 +305,9 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 }
 
 int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
+#ifdef NO_INOTIFY
+    return -1;
+#else
 	int wd = inotify_add_watch(inotify_fd, path_buf, flags);
 	if (wd >= 0) {
 		int absent;
@@ -286,6 +319,7 @@ int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table,
 	} else
 		perror("inotify_add_watch");
 	return wd;
+#endif
 }
 
 int deleteFileOrDirectoryNoEvent(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table) {
@@ -315,7 +349,11 @@ int mkFullDir(int inotify_fd, const char *filename_with_path, khash_t(fd_to_name
 
 		dir[0] = 0;
 
+#ifdef _WIN32
+		last_err = mkdir(full_path);
+#else
 		last_err = mkdir(full_path, S_IRWXU);
+#endif
 		if (!last_err) {
 			struct utimbuf times;
 			times.actime = 0;
@@ -346,6 +384,9 @@ int renameFileOrDirectoryNoEvent(int inotify_fd, const char *from, const char *t
 }
 
 int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_table) {
+#ifdef NO_INOTIFY
+    return 0;
+#else
 	DIR *dir = opendir(path);
 	if (!dir) {
 		perror("opendir");
@@ -379,14 +420,17 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 	}
 	closedir(dir);
 	return 0;
+#endif
 }
 
 void clearCache(char **to_delete, int *to_delete_files, const char *path_buf) {
-	for (int i = 0; i < *to_delete_files; i ++) {
+    int i;
+    int j;
+	for (i = 0; i < *to_delete_files; i ++) {
 		if (!strcmp(to_delete[i], path_buf)) {
 			DEBUG_PRINT("clear cache [%s]\n", path_buf);
 			free(to_delete[i]);
-			for (int j = i; j < *to_delete_files - 1; j ++)
+			for (j = i; j < *to_delete_files - 1; j ++)
 				to_delete[j] = to_delete[j + 1];
 			to_delete[*to_delete_files] = 0;
 			(*to_delete_files) --;
@@ -396,7 +440,8 @@ void clearCache(char **to_delete, int *to_delete_files, const char *path_buf) {
 }
 
 void notifyCache(struct doops_loop *loop, char **to_delete, int *to_delete_files, const char *method, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
-	for (int i = 0; i < *to_delete_files; i ++) {
+    int i;
+	for (i = 0; i < *to_delete_files; i ++) {
 		DEBUG_PRINT("%s cache: %s\n", method, to_delete[i]);
 		if (to_delete[i]) {
 			notifyEvent(loop, to_delete[i], method, public_key, private_key, local_public_key, local_private_key, hash_table);
@@ -418,6 +463,7 @@ int addCache(char **to_delete, int *to_delete_files, int limit, const char *path
 	return 0;
 }
 
+#ifndef _WIN32
 int consume(struct doops_loop *loop, int inotify_fd, const char *events, int length, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
 	if (!events)
 		return -1;
@@ -523,6 +569,7 @@ int consume(struct doops_loop *loop, int inotify_fd, const char *events, int len
 
 	return 0;
 }
+#endif
 
 char *list(khash_t(fd_to_name) *hash_table, int root_len, int *written_len) {
 	int buf_size = 1024 * 1024;
@@ -580,30 +627,44 @@ int readFile(unsigned char *buf, int size, char *path) {
 		perror("open");
 		return -1;
 	}
+#ifndef _WIN32
 	flock(fd, LOCK_SH);
+#endif
 
 	int bytes_read = 0;
 	do {
 		int bytes = read(fd, buf + bytes_read, size - bytes_read);
 		if (bytes <= 0) {
 			perror("read");
+#ifndef _WIN32
 			flock(fd, LOCK_UN);
+#endif
 			close(fd);
 			return bytes_read;
 		}
 		bytes_read += bytes;
 	} while (bytes_read < size);
 
+#ifndef _WIN32
 	flock(fd, LOCK_UN);
+#endif
 	close(fd);
 	return bytes_read;
 }
 
 int mkdirAuto(char *full_path, mode_t mode, int inotify_fd, khash_t(fd_to_name) *hash_table) {
+#ifdef _WIN32
+	int err = mkdir(full_path);
+#else
 	int err = mkdir(full_path, mode);
+#endif
 	if (err) {
 		mkFullDir(inotify_fd, full_path, hash_table);
+#ifdef _WIN32
+		err = mkdir(full_path);
+#else
 		err = mkdir(full_path, mode);
+#endif
 	}
 
 	if (!err)
@@ -665,6 +726,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 	else
 		snprintf(sync_file, sizeof(sync_file), ".sync.%08x", file_write_index);
 
+#ifndef _WIN32
 	if ((mode & S_IFMT) == S_IFLNK) {
 		deleteFileOrDirectoryNoEvent(inotify_fd, sync_file, hash_table);
 		if (symlink((char *)file_data, sync_file)) {
@@ -686,21 +748,27 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 
 		add_skip_event(full_path);
 		return 0;
-	} else {
+	} else
+#endif
+    {
 		int fd = open(sync_file, O_WRONLY | O_CREAT | O_TRUNC, mode);
 		if (fd < 0) {
 			perror("open");
 			return -1;
 		}
 
+#ifndef _WIN32
 		flock(fd, LOCK_EX);
+#endif
 
 		int written = 0;
 		while (written < file_size) {
 			int written_bytes = write(fd, file_data + written, file_size - written);
 			if (written_bytes < 0) {
 				perror("write");
+#ifndef _WIN32
 				flock(fd, LOCK_UN);
+#endif
 				close(fd);
 				unlink(sync_file);
 				return -1;
@@ -708,7 +776,9 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 			written += written_bytes;
 		}
 
+#ifndef _WIN32
 		flock(fd, LOCK_UN);
+#endif
 		close(fd);
 	}
 
@@ -741,7 +811,7 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 		perror("lstat");
 		return NULL;
 	}
-
+#ifndef _WIN32
 	if ((buf.st_mode & S_IFMT) == S_IFLNK) {
 		*size = MAX_PATH + 4096;
 		buffer = (unsigned char *)malloc(*size);
@@ -759,13 +829,16 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 			perror("malloc");
 		return buffer;
 	}
+#endif
 
 	int fd = open(path, O_RDONLY, 0644);
 	if (fd < 0) {
 		perror("open");
 		return NULL;
 	}
+#ifndef _WIN32
 	flock(fd, LOCK_SH);
+#endif
 
 	*size = lseek(fd, 0, SEEK_END);
 	lseek(fd, 0, SEEK_SET);
@@ -779,7 +852,9 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 				int bytes = read(fd, buffer + bytes_read, *size - bytes_read);
 				if (bytes <= 0) {
 					free(buffer);
+#ifndef _WIN32
 					flock(fd, LOCK_UN);
+#endif
 					close(fd);
 					return NULL;
 				}
@@ -788,7 +863,9 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 		} else
 			perror("malloc");
 	}
+#ifndef _WIN32
 	flock(fd, LOCK_UN);
+#endif
 	close(fd);
 	return buffer;
 }
@@ -866,7 +943,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	unsigned int msg_size = 0;
 	char full_path[MAX_PATH];
 
-	ssize_t recv_size = recv(socket, &msg_size, sizeof(msg_size), MSG_NOSIGNAL);
+	ssize_t recv_size = recv(socket, (char *)&msg_size, sizeof(msg_size), MSG_NOSIGNAL);
 	struct remote_client *host = findHost(socket);
 	if ((recv_size <= 0) || (!host)) {
 		DEBUG_PRINT("cannot identify host\n");
@@ -877,7 +954,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 
 	msg_size = ntohl(msg_size);
 	if (msg_size == 32) {
-		if (recv(socket, host->public_key, 32, MSG_NOSIGNAL) != 32) {
+		if (recv(socket, (char *)host->public_key, 32, MSG_NOSIGNAL) != 32) {
 			perror("recv");
 			loop_remove_io(loop, socket);
 			closeSocket(socket);
@@ -902,7 +979,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	}
 	unsigned int len_received = 0;
 	while (len_received < msg_size) {
-		recv_size = recv(socket, buffer + len_received, msg_size - len_received, MSG_NOSIGNAL);
+		recv_size = recv(socket, (char *)(buffer + len_received), msg_size - len_received, MSG_NOSIGNAL);
 		if (recv_size <= 0) {
 			perror("recv");
 			loop_remove_io(loop, socket);
@@ -1200,10 +1277,18 @@ int main(int argc, char **argv) {
 	static unsigned char local_private_key[32];
 	static unsigned char local_public_key[32];
 
+#ifdef _WIN32
+    WORD wVersionRequested = MAKEWORD(2, 2);
+    WSADATA wsaData;
+
+    WSAStartup(wVersionRequested, &wsaData);
+#endif
+
 	fprintf(stderr, "carbonpaper v0.1 - real-time bidirectional directory synchronization tool\n(c)2023 by Eduard Suica (BSD-simplified license)\n\n");
 
 	int path_index = 1;
-	for (int i = 1; i < argc; i ++) {
+    int i;
+	for (i = 1; i < argc; i ++) {
 		if (strcmp(argv[i], "--genkey") == 0) {
 			if (i + 1 < argc) {
 				i ++;
@@ -1287,6 +1372,7 @@ int main(int argc, char **argv) {
 		exit(1);
 	}
 
+#ifndef NO_INOTIFY
 	fd = inotify_init();
 
 	if (fd < 0) {
@@ -1299,6 +1385,9 @@ int main(int argc, char **argv) {
 		perror("inotify_init");
 		exit(1);
 	}
+#else
+    fd = 0;
+#endif
 
 	static int server_socket;
 	static int inotify_fd;
@@ -1319,7 +1408,7 @@ int main(int argc, char **argv) {
 	servaddr.sin_port = htons(port);
 
 	int val = 1;
-	setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(int));
+	setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&val, sizeof(int));
 
 	if ((bind(server_socket, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
 		perror("bind");
@@ -1340,11 +1429,15 @@ int main(int argc, char **argv) {
 	k = kh_put(fd_to_name, hash_table, wd, &absent);
 	kh_value(hash_table, k) = strdup(argv[path_index]);
 
+#ifndef _WIN32
 	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	loop_init(&loop);
 
+#ifndef NO_INOTIFY
 	loop_add_io(&loop, fd, DOOPS_READ);
+#endif
 	loop_add_io(&loop, server_socket, DOOPS_READ);
 
 	root_path = argv[path_index];
@@ -1379,7 +1472,7 @@ int main(int argc, char **argv) {
 				loop_pause_write_io(loop, sock);
 				return;
 			}
-			int sent = send(sock, host->write_buffer, host->write_buffer_len, MSG_NOSIGNAL);
+			int sent = send(sock, (const char *)host->write_buffer, host->write_buffer_len, MSG_NOSIGNAL);
 			if (sent < 0) {
 				perror("send");
 				free(host->write_buffer);
@@ -1407,7 +1500,7 @@ int main(int argc, char **argv) {
 				loop_pause_write_io(loop, sock);
 				return;
 			}
-			int sent = send(sock, host->write_buffer_a, host->write_buffer_len_a, MSG_NOSIGNAL);
+			int sent = send(sock, (const char *)host->write_buffer_a, host->write_buffer_len_a, MSG_NOSIGNAL);
 			if (sent < 0) {
 				perror("send");
 				free(host->write_buffer_a);
@@ -1433,7 +1526,9 @@ int main(int argc, char **argv) {
 	});
 
 	loop_on_read(&loop, {
+#ifndef NO_INOTIFY
 		char buffer[EVENT_BUF_LEN];
+#endif
 		int fd = loop_event_socket(loop);
 		if (fd == server_socket) {
 			struct sockaddr_in client_addr;
@@ -1457,17 +1552,22 @@ int main(int argc, char **argv) {
 				}
 			}
 		} else
+#ifndef NO_INOTIFY
 		if (fd == inotify_fd) {
 			int length = read(fd, buffer, EVENT_BUF_LEN);
 			consume(loop, fd, buffer, length, public_key, private_key, local_public_key, local_private_key, hash_table);
-		} else {
+		} else
+#endif
+        {
 			receiveData(loop, fd, public_key, private_key, local_public_key, local_private_key, inotify_fd, hash_table);
 		}
     	});
 	loop_run(&loop);
 	loop_deinit(&loop);
 
+#ifndef NO_INOTIFY
 	inotify_rm_watch(fd, wd);
+#endif
 
 	for (k = 0; k < kh_end(hash_table); ++k) {
 		if (kh_exist(hash_table, k))
@@ -1482,4 +1582,8 @@ int main(int argc, char **argv) {
 	hash_table = NULL;
 
    	close(fd);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
 }
