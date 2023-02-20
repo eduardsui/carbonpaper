@@ -16,6 +16,7 @@
 	#define WIN32_LEAN_AND_MEAN
 	#include <winsock2.h>
 	#include <windows.h>
+	#include <wincrypt.h>
 	#include <sys/utime.h>
 
 	#define socklen_t			int
@@ -873,6 +874,16 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 int genKey(const char *path) {
 	unsigned char temp[32];
 
+#ifdef _WIN32
+	HCRYPTPROV hProvider = 0;
+	if (CryptAcquireContext(&hProvider, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+		if (!CryptGenRandom(hProvider, sizeof(temp), (BYTE *)temp)) {
+			CryptReleaseContext(hProvider, 0);
+            return -1;
+        }
+		CryptReleaseContext(hProvider, 0);
+    }
+#else
 	int fd = open("/dev/random", O_RDONLY);
 	if (fd < 0) {
 		perror("open");
@@ -888,6 +899,7 @@ int genKey(const char *path) {
 		len += bytes;
 	}
 	close(fd);
+#endif
 
 	unsigned char public_key[32];
 	unsigned char private_key[64];
