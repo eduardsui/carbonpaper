@@ -13,41 +13,41 @@
 #include <utime.h>
 
 #ifdef _WIN32
-    #define WIN32_LEAN_AND_MEAN
-    #include <winsock2.h>
-    #include <windows.h>
-    #include <sys/utime.h>
+	#define WIN32_LEAN_AND_MEAN
+	#include <winsock2.h>
+	#include <windows.h>
+	#include <sys/utime.h>
 
-    #define socklen_t           int
-    #define lstat               stat
-    #define MSG_NOSIGNAL        0
-    #define NO_INOTIFY
+	#define socklen_t			int
+	#define lstat				stat
+	#define MSG_NOSIGNAL		0
+	#define NO_INOTIFY
 
-    #define WITH_SELECT
+	#define WITH_SELECT
 
-    #define INOTIFY_FLAGS       0
-    #define INOTIFY_FILE_FLAGS  0
+	#define INOTIFY_FLAGS		0
+	#define INOTIFY_FILE_FLAGS	0
 
-    static int lutimes(const char *sync_file, struct timeval times[2]) {
-        struct _utimbuf time_buf;
-        time_buf.actime = times[0].tv_sec;
-        time_buf.modtime = times[1].tv_sec;
-        return _utime(sync_file, &time_buf);
-    }
+	static int lutimes(const char *sync_file, struct timeval times[2]) {
+		struct _utimbuf time_buf;
+		time_buf.actime = times[0].tv_sec;
+		time_buf.modtime = times[1].tv_sec;
+		return _utime(sync_file, &time_buf);
+	}
 
-    #undef MAX_PATH
+	#undef MAX_PATH
 #else
-    #include <netdb.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
-    #include <sys/inotify.h>
-    #include <sys/socket.h>
-    #include <sys/time.h>
+	#include <netdb.h>
+	#include <netinet/in.h>
+	#include <arpa/inet.h>
+	#include <sys/inotify.h>
+	#include <sys/socket.h>
+	#include <sys/time.h>
 
-    #define WITH_POLL
+	#define WITH_POLL
 
-    #define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
-    #define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+	#define INOTIFY_FLAGS		IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+	#define INOTIFY_FILE_FLAGS	IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVED_TO | IN_DONT_FOLLOW | IN_EXCL_UNLINK
 #endif
 
 #include "khash.h"
@@ -70,10 +70,10 @@ KHASH_MAP_INIT_INT(fd_to_name, char *)
 KHASH_MAP_INIT_INT64(inotify_ignore, unsigned int)
 
 static char * timestamp() {
-    time_t now = time(NULL); 
-    char * time = asctime(gmtime(&now));
-    time[strlen(time)-1] = '\0';    // Remove \n
-    return time;
+	time_t now = time(NULL); 
+	char * time = asctime(gmtime(&now));
+	time[strlen(time)-1] = '\0'; // Remove \n
+	return time;
 }
 
 struct remote_client {
@@ -192,7 +192,7 @@ void closeSocket(int sock) {
 	if (sock <= 0)
 		return;
 
-    int i;
+	int i;
 	for (i = 0; i < clients; i ++) {
 		if (hosts[i].sock == sock) {
 			hosts[i].sock = 0;
@@ -306,7 +306,7 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 
 int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
 #ifdef NO_INOTIFY
-    return -1;
+	return -1;
 #else
 	int wd = inotify_add_watch(inotify_fd, path_buf, flags);
 	if (wd >= 0) {
@@ -385,7 +385,7 @@ int renameFileOrDirectoryNoEvent(int inotify_fd, const char *from, const char *t
 
 int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_table) {
 #ifdef NO_INOTIFY
-    return 0;
+	return 0;
 #else
 	DIR *dir = opendir(path);
 	if (!dir) {
@@ -424,8 +424,8 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 }
 
 void clearCache(char **to_delete, int *to_delete_files, const char *path_buf) {
-    int i;
-    int j;
+	int i;
+	int j;
 	for (i = 0; i < *to_delete_files; i ++) {
 		if (!strcmp(to_delete[i], path_buf)) {
 			DEBUG_PRINT("clear cache [%s]\n", path_buf);
@@ -440,7 +440,7 @@ void clearCache(char **to_delete, int *to_delete_files, const char *path_buf) {
 }
 
 void notifyCache(struct doops_loop *loop, char **to_delete, int *to_delete_files, const char *method, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
-    int i;
+	int i;
 	for (i = 0; i < *to_delete_files; i ++) {
 		DEBUG_PRINT("%s cache: %s\n", method, to_delete[i]);
 		if (to_delete[i]) {
@@ -750,7 +750,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 		return 0;
 	} else
 #endif
-    {
+	{
 		int fd = open(sync_file, O_WRONLY | O_CREAT | O_TRUNC, mode);
 		if (fd < 0) {
 			perror("open");
@@ -884,8 +884,8 @@ int genKey(const char *path) {
 		if (bytes < 0) {
 			close(fd);
 			return -1;
-        	}
-        	len += bytes;
+		}
+		len += bytes;
 	}
 	close(fd);
 
@@ -918,8 +918,8 @@ int genLocalKey(unsigned char private_key[32], unsigned char public_key[32]) {
 		if (bytes < 0) {
 			close(fd);
 			return -1;
-        	}
-        	len += bytes;
+		}
+		len += bytes;
 	}
 	close(fd);
 
@@ -1278,16 +1278,16 @@ int main(int argc, char **argv) {
 	static unsigned char local_public_key[32];
 
 #ifdef _WIN32
-    WORD wVersionRequested = MAKEWORD(2, 2);
-    WSADATA wsaData;
+	WORD wVersionRequested = MAKEWORD(2, 2);
+	WSADATA wsaData;
 
-    WSAStartup(wVersionRequested, &wsaData);
+	WSAStartup(wVersionRequested, &wsaData);
 #endif
 
 	fprintf(stderr, "carbonpaper v0.1 - real-time bidirectional directory synchronization tool\n(c)2023 by Eduard Suica (BSD-simplified license)\n\n");
 
 	int path_index = 1;
-    int i;
+	int i;
 	for (i = 1; i < argc; i ++) {
 		if (strcmp(argv[i], "--genkey") == 0) {
 			if (i + 1 < argc) {
@@ -1386,7 +1386,7 @@ int main(int argc, char **argv) {
 		exit(1);
 	}
 #else
-    fd = 0;
+	fd = 0;
 #endif
 
 	static int server_socket;
@@ -1558,10 +1558,10 @@ int main(int argc, char **argv) {
 			consume(loop, fd, buffer, length, public_key, private_key, local_public_key, local_private_key, hash_table);
 		} else
 #endif
-        {
+		{
 			receiveData(loop, fd, public_key, private_key, local_public_key, local_private_key, inotify_fd, hash_table);
 		}
-    	});
+	});
 	loop_run(&loop);
 	loop_deinit(&loop);
 
@@ -1581,9 +1581,9 @@ int main(int argc, char **argv) {
 
 	hash_table = NULL;
 
-   	close(fd);
+	close(fd);
 #ifdef _WIN32
-    WSACleanup();
+	WSACleanup();
 #endif
-    return 0;
+	return 0;
 }
