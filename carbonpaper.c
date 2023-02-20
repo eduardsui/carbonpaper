@@ -37,6 +37,8 @@
 	}
 
 	#undef MAX_PATH
+
+    #define open(path, oflag , pmode)   _open(path, oflag | O_BINARY, 0);
 #else
 	#include <netdb.h>
 	#include <netinet/in.h>
@@ -919,7 +921,17 @@ int genKey(const char *path) {
 int genLocalKey(unsigned char private_key[32], unsigned char public_key[32]) {
 	unsigned char temp[32];
 
-	int fd = open("/dev/random", O_RDONLY);
+#ifdef _WIN32
+	HCRYPTPROV hProvider = 0;
+	if (CryptAcquireContext(&hProvider, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+		if (!CryptGenRandom(hProvider, sizeof(temp), (BYTE *)temp)) {
+			CryptReleaseContext(hProvider, 0);
+            return -1;
+        }
+		CryptReleaseContext(hProvider, 0);
+    }
+#else
+    int fd = open("/dev/random", O_RDONLY);
 	if (fd < 0) {
 		perror("open");
 		return -1;
@@ -934,6 +946,7 @@ int genLocalKey(unsigned char private_key[32], unsigned char public_key[32]) {
 		len += bytes;
 	}
 	close(fd);
+#endif
 
 	crypto_blake2b(private_key, 32, temp, 32);
 	crypto_x25519_public_key(public_key, private_key);
@@ -1524,6 +1537,7 @@ int main(int argc, char **argv) {
 				return;
 			}
 			if (sent > 0) {
+				host->timestamp = time(NULL);
 				if (sent == host->write_buffer_len_a) {
 					free(host->write_buffer_a);
 					host->write_buffer_a = NULL;
