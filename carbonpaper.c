@@ -646,7 +646,7 @@ int writeFileAuto(unsigned char *data, int size, int inotify_fd, khash_t(fd_to_n
 	snprintf(full_path, sizeof(full_path), "%s/%s", root_path, path);
 
 	struct stat buf;
-	if ((!replace) && (!lstat(path, &buf)) && (buf.st_mtime > mtime) && (buf.st_mode == mode)) {
+	if ((!replace) && (!lstat(full_path, &buf)) && (buf.st_mtime > mtime) && (buf.st_mode == mode)) {
 		DEBUG_PRINT("local file is newer %s (%u > %u)\n",  full_path, (unsigned int)buf.st_mtime, (unsigned int)mtime);
 		return 0;
 	}
