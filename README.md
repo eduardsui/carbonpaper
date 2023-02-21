@@ -31,7 +31,7 @@ or
 ``clang -fblocks carbonpaper.c -lBlocksRuntime -o carbonpaper``
 
 Note that it uses [doops](https://github.com/eduardsui/doops) event scheduler. It can be compiled with both gcc and clang.
-It currently works only on linux (heavily depends on [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html)).
+It currently works on linux (heavily depends on [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html)) and has basic support on Windows. On systems without inotify(FreeBSD, macOS) you may still be able to compile it, but the sync will be unidirectional.
 
 Usage
 -----------
