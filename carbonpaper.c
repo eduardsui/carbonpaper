@@ -310,7 +310,16 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 
 #ifdef NO_INOTIFY
 int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
-	return 0;
+	static int virtual_fd_watch = -1;
+	int absent;
+	khint_t k = kh_put(fd_to_name, hash_table, virtual_fd_watch, &absent);
+	if (!absent)
+		free((char *)kh_value(hash_table, k));
+	kh_value(hash_table, k) = strdup(path_buf);
+
+	virtual_fd_watch --;
+
+	return -(virtual_fd_watch + 1);
 }
 #else
 int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
@@ -390,9 +399,6 @@ int renameFileOrDirectoryNoEvent(int inotify_fd, const char *from, const char *t
 }
 
 int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_table) {
-#ifdef NO_INOTIFY
-	return 0;
-#else
 	DIR *dir = opendir(path);
 	if (!dir) {
 		perror("opendir");
@@ -415,7 +421,11 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 		}
 
 
+#ifdef _WIN32
+		if (((buf.st_mode & S_IFMT) == S_IFDIR) || ((buf.st_mode & S_IFMT) == S_IFREG)) {
+#else
 		if (((buf.st_mode & S_IFMT) == S_IFDIR) || ((buf.st_mode & S_IFMT) == S_IFREG) || ((buf.st_mode & S_IFMT) == S_IFLNK)) {
+#endif
 			if ((buf.st_mode & S_IFMT) == S_IFDIR) {
 				watch(inotify_fd, path_buf, hash_table, INOTIFY_FLAGS);
 				scan_directory(inotify_fd, path_buf, hash_table);
@@ -426,7 +436,6 @@ int scan_directory(int inotify_fd, const char *path, khash_t(fd_to_name) *hash_t
 	}
 	closedir(dir);
 	return 0;
-#endif
 }
 
 void clearCache(char **to_delete, int *to_delete_files, const char *path_buf) {
@@ -1689,4 +1698,4 @@ int main(int argc, char **argv) {
 	close(fd);
 #endif
 	return 0;
-}
+} 
