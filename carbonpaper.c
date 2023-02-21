@@ -17,6 +17,7 @@
 	#include <winsock2.h>
 	#include <windows.h>
 	#include <wincrypt.h>
+	#include <fileapi.h>
 	#include <sys/utime.h>
 
 	#define socklen_t		int
@@ -307,10 +308,12 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 	return 0;
 }
 
-int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
 #ifdef NO_INOTIFY
-	return -1;
+int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
+	return 0;
+}
 #else
+int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table, int flags) {
 	int wd = inotify_add_watch(inotify_fd, path_buf, flags);
 	if (wd >= 0) {
 		int absent;
@@ -322,8 +325,8 @@ int watch(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table,
 	} else
 		perror("inotify_add_watch");
 	return wd;
-#endif
 }
+#endif
 
 int deleteFileOrDirectoryNoEvent(int inotify_fd, const char *path_buf, khash_t(fd_to_name) *hash_table) {
 	int err = 0;
@@ -466,7 +469,62 @@ int addCache(char **to_delete, int *to_delete_files, int limit, const char *path
 	return 0;
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+int consume(struct doops_loop *loop, char *path, HANDLE filechanged, OVERLAPPED *overlapped, char *change_buf, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
+	if ((!overlapped) || (!change_buf))
+		return -1;
+
+	DWORD bytes_transferred;
+	GetOverlappedResult(filechanged, overlapped, &bytes_transferred, FALSE);
+	FILE_NOTIFY_INFORMATION *event = (FILE_NOTIFY_INFORMATION*)change_buf;
+	char filename[MAX_PATH + 1];
+	char full_path[MAX_PATH + 1];
+	while (1) {
+		DWORD name_len = event->FileNameLength / sizeof(wchar_t);
+
+		int len = WideCharToMultiByte(CP_UTF8, 0, event->FileName, (int)name_len, filename, MAX_PATH, NULL, NULL);
+		filename[len] = 0;
+		int i;
+		for (i = 0; i < len; i ++) {
+			if (filename[i] == '\\')
+				filename[i] = '/';
+		}
+
+		snprintf(full_path, sizeof(full_path), "%s/%s", path, filename);
+
+		DEBUG_INFO("file %s changed\n", full_path);
+
+		switch (event->Action) {
+			case FILE_ACTION_ADDED:
+				DEBUG_PRINT("created [%s]\n", full_path);
+				notifyEvent(loop, full_path, "created", public_key, private_key, local_public_key, local_private_key, hash_table);
+				break;
+			case FILE_ACTION_REMOVED:
+				DEBUG_PRINT("deleted [%s]\n", full_path);
+				if (enable_file_delete)
+					notifyEvent(loop, full_path, "deleted", public_key, private_key, local_public_key, local_private_key, hash_table);
+				break;
+			case FILE_ACTION_MODIFIED:
+				DEBUG_PRINT("written [%s]\n", full_path);
+				notifyEvent(loop, full_path, "write", public_key, private_key, local_public_key, local_private_key, hash_table);
+				break;
+			case FILE_ACTION_RENAMED_OLD_NAME:
+				DEBUG_PRINT("move (old name) [%s] (ignored)\n", full_path);
+				break;
+			case FILE_ACTION_RENAMED_NEW_NAME:
+				DEBUG_PRINT("move [%s]\n", full_path);
+				notifyEvent(loop, full_path, "move", public_key, private_key, local_public_key, local_private_key, hash_table);
+				break;
+		}
+		if (event->NextEntryOffset) {
+			*((uint8_t**)&event) += event->NextEntryOffset;
+		} else {
+			break;
+		}
+	}
+	return 0;
+}
+#else
 int consume(struct doops_loop *loop, int inotify_fd, const char *events, int length, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], khash_t(fd_to_name) *hash_table) {
 	if (!events)
 		return -1;
@@ -881,10 +939,10 @@ int genKey(const char *path) {
 	if (CryptAcquireContext(&hProvider, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
 		if (!CryptGenRandom(hProvider, sizeof(temp), (BYTE *)temp)) {
 			CryptReleaseContext(hProvider, 0);
-            return -1;
-        }
+			return -1;
+		}
 		CryptReleaseContext(hProvider, 0);
-    }
+	}
 #else
 	int fd = open("/dev/random", O_RDONLY);
 	if (fd < 0) {
@@ -926,12 +984,12 @@ int genLocalKey(unsigned char private_key[32], unsigned char public_key[32]) {
 	if (CryptAcquireContext(&hProvider, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
 		if (!CryptGenRandom(hProvider, sizeof(temp), (BYTE *)temp)) {
 			CryptReleaseContext(hProvider, 0);
-            return -1;
-        }
+			return -1;
+		}
 		CryptReleaseContext(hProvider, 0);
-    }
+	}
 #else
-    int fd = open("/dev/random", O_RDONLY);
+	int fd = open("/dev/random", O_RDONLY);
 	if (fd < 0) {
 		perror("open");
 		return -1;
@@ -1450,11 +1508,11 @@ int main(int argc, char **argv) {
 
 	scan_directory(fd, argv[path_index], hash_table);
 
+#ifndef _WIN32
 	int absent;
 	k = kh_put(fd_to_name, hash_table, wd, &absent);
 	kh_value(hash_table, k) = strdup(argv[path_index]);
 
-#ifndef _WIN32
 	signal(SIGPIPE, SIG_IGN);
 #endif
 
@@ -1484,6 +1542,22 @@ int main(int argc, char **argv) {
 		}, -4800);
 	}
 
+#ifdef _WIN32
+	HANDLE filechanged = CreateFileA(argv[path_index], FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
+	OVERLAPPED overlapped;
+	overlapped.hEvent = CreateEvent(NULL, FALSE, 0, NULL);
+	uint8_t change_buf[1024];
+
+	if (ReadDirectoryChangesW(filechanged, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE, NULL, &overlapped, NULL)) {
+		loop_schedule(&loop, {
+			if (WaitForSingleObject(overlapped.hEvent, 10) == WAIT_OBJECT_0)
+				consume(loop, argv[path_index], filechanged, &overlapped, change_buf, public_key, private_key, local_public_key, local_private_key, hash_table);
+			ReadDirectoryChangesW(filechanged, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE, NULL, &overlapped, NULL);
+		}, 1000);
+	} else {
+		DEBUG_INFO("error initializing file watcher - local files will not be uploaded\n");
+	}
+#endif
 	loop_on_write(&loop, {
 		int sock = loop_event_socket(loop);
 		struct remote_client *host = (struct remote_client *)loop_event_data(loop);
@@ -1607,9 +1681,12 @@ int main(int argc, char **argv) {
 
 	hash_table = NULL;
 
-	close(fd);
 #ifdef _WIN32
+	CloseHandle(overlapped.hEvent);
+	CloseHandle(filechanged);
 	WSACleanup();
+#else
+	close(fd);
 #endif
 	return 0;
 }
