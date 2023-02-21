@@ -1559,10 +1559,11 @@ int main(int argc, char **argv) {
 
 	if (ReadDirectoryChangesW(filechanged, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE, NULL, &overlapped, NULL)) {
 		loop_schedule(&loop, {
-			if (WaitForSingleObject(overlapped.hEvent, 10) == WAIT_OBJECT_0)
+			if (WaitForSingleObject(overlapped.hEvent, 10) == WAIT_OBJECT_0) {
 				consume(loop, argv[path_index], filechanged, &overlapped, change_buf, public_key, private_key, local_public_key, local_private_key, hash_table);
-			ReadDirectoryChangesW(filechanged, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE, NULL, &overlapped, NULL);
-		}, 1000);
+				ReadDirectoryChangesW(filechanged, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE, NULL, &overlapped, NULL);
+			}
+		}, 480);
 	} else {
 		DEBUG_INFO("error initializing file watcher - local files will not be uploaded\n");
 	}
@@ -1698,4 +1699,4 @@ int main(int argc, char **argv) {
 	close(fd);
 #endif
 	return 0;
-} 
+}
