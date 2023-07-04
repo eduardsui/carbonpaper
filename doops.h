@@ -1047,7 +1047,7 @@ static void loop_run(struct doops_loop *loop) {
     if (!loop)
         return;
 
-    int sleep_val;
+    int sleep_val = DOOPS_MAX_SLEEP;
     while (((loop->events) || ((loop->io_wait) && (loop->io_objects))) && (!loop->quit)) {
         loop->event_fd = -1;
         int loops = _private_loop_iterate(loop, &sleep_val);
