@@ -1344,7 +1344,7 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 	if (connect(host->sock, (struct sockaddr *)&host->servaddr, sizeof(host->servaddr))) {
 #ifndef _WIN32
 		int connected = 0;
-		if ((errno == EWOULDBLOCK) || (errno != EINPROGRESS)) {
+		if ((errno == EWOULDBLOCK) || (errno == EINPROGRESS)) {
 			struct pollfd pfds[] = { { .fd = host->sock, .events = POLLOUT } };
 			if (poll(pfds, 1, 480) > 0) {
                         	int error = 0;
