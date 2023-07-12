@@ -1339,7 +1339,7 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 #ifndef _WIN32
 	int arg = fcntl(host->sock, F_GETFL, NULL);
 	if (arg > 0)
-		fcntl(host->sock, F_SETFL, O_NONBLOCK);	
+		fcntl(host->sock, F_SETFL, arg | O_NONBLOCK);
 #endif
 	if (connect(host->sock, (struct sockaddr *)&host->servaddr, sizeof(host->servaddr))) {
 #ifndef _WIN32
@@ -1364,6 +1364,9 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 			return -1;
 		}
 	}
+#ifndef _WIN32
+	fcntl(host->sock, F_SETFL, arg);
+#endif
 
 	unsigned int size = htonl(32);
 	addToBuffer(loop, host, host->sock, (unsigned char *)&size, sizeof(int));
