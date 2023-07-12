@@ -1336,12 +1336,33 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 	host->servaddr.sin_addr.s_addr = inet_addr(host->hostname);
 	host->servaddr.sin_port = htons(host->port);
 
+#ifndef _WIN32
+	int arg = fcntl(host->sock, F_GETFL, NULL);
+	if (arg > 0)
+		fcntl(host->sock, F_SETFL, O_NONBLOCK);	
+#endif
 	if (connect(host->sock, (struct sockaddr *)&host->servaddr, sizeof(host->servaddr))) {
-		perror("connect");
-		DEBUG_PRINT("error connecting to %s:%i\n", host->hostname, host->port);
-		close(host->sock);
-		host->sock = 0;
-		return -1;
+#ifndef _WIN32
+		int connected = 0;
+		if ((errno == EWOULDBLOCK) || (errno != EINPROGRESS)) {
+			struct pollfd pfds[] = { { .fd = host->sock, .events = POLLOUT } };
+			if (poll(pfds, 1, 480) > 0) {
+                        	int error = 0;
+				socklen_t len = sizeof(error);
+
+                	        if ((!getsockopt(host->sock, SOL_SOCKET, SO_ERROR, &error, &len)) && (!error))
+					connected = 1;
+			}
+		}
+		if (!connected)
+#endif
+		{
+			perror("connect");
+			DEBUG_PRINT("error connecting to %s:%i\n", host->hostname, host->port);
+			close(host->sock);
+			host->sock = 0;
+			return -1;
+		}
 	}
 
 	unsigned int size = htonl(32);
