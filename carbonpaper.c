@@ -94,6 +94,8 @@ struct remote_client {
 
 	unsigned char *write_buffer_a;
 	int write_buffer_len_a;
+
+	time_t connect_request;
 };
 
 static struct remote_client *hosts = NULL;
@@ -185,6 +187,16 @@ struct remote_client *findHost(int sock) {
 	for (i = 0; i < clients; i ++) {
 		if ((hosts[i].sock == sock) || (hosts[i].sock_accept == sock)) {
 			hosts[i].timestamp = time(NULL);
+			if ((hosts[i].sock == sock) && (hosts[i].connect_request)) {
+#ifndef _WIN32
+				int arg = fcntl(sock, F_GETFL, NULL);
+				if (arg > 0)
+					fcntl(sock, F_SETFL, arg & (~O_NONBLOCK));
+
+				hosts[i].connect_request = 0;
+				DEBUG_INFO("connected to %s:%i\n", hosts[i].hostname, hosts[i].port);
+#endif
+			}
 			return &hosts[i];
 		}
 	}
@@ -299,7 +311,7 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 	int size = snprintf((char *)buffer, MAX_PATH * 2, "DESC\n%s:%u.%u:%o:%s\n", event_type, (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
 	int i = 0;
 	for (i = 0; i < clients; i ++) {
-		if (hosts[i].sock > 0)
+		if ((hosts[i].sock > 0) && (!hosts[i].connect_request))
 			sendData(loop, &hosts[i], hosts[i].sock, buffer, size, public_key, private_key, local_public_key, local_private_key, hosts[i].public_key, hash_table);
 		else
 		if (hosts[i].sock_accept > 0)
@@ -1038,6 +1050,14 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	ssize_t recv_size = recv(socket, (char *)&msg_size, sizeof(msg_size), MSG_NOSIGNAL);
 	struct remote_client *host = findHost(socket);
 	if ((recv_size <= 0) || (!host)) {
+#ifndef _WIN32
+		if ((host) && ((errno == EWOULDBLOCK) || (errno == EINPROGRESS))) {
+			// not yet connected
+			host->timestamp = time(NULL);
+			return 0;
+		}
+#endif
+
 		DEBUG_PRINT("cannot identify host\n");
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
@@ -1336,6 +1356,7 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 	host->servaddr.sin_addr.s_addr = inet_addr(host->hostname);
 	host->servaddr.sin_port = htons(host->port);
 
+	host->connect_request = 0;
 #ifndef _WIN32
 	int arg = fcntl(host->sock, F_GETFL, NULL);
 	if (arg > 0)
@@ -1343,18 +1364,10 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 #endif
 	if (connect(host->sock, (struct sockaddr *)&host->servaddr, sizeof(host->servaddr))) {
 #ifndef _WIN32
-		int connected = 0;
-		if ((errno == EWOULDBLOCK) || (errno == EINPROGRESS)) {
-			struct pollfd pfds[] = { { .fd = host->sock, .events = POLLOUT } };
-			if (poll(pfds, 1, 480) > 0) {
-                        	int error = 0;
-				socklen_t len = sizeof(error);
+		if ((errno == EWOULDBLOCK) || (errno == EINPROGRESS))
+			host->connect_request = time(NULL);
 
-                	        if ((!getsockopt(host->sock, SOL_SOCKET, SO_ERROR, &error, &len)) && (!error))
-					connected = 1;
-			}
-		}
-		if (!connected)
+		if (!host->connect_request)
 #endif
 		{
 			perror("connect");
@@ -1364,19 +1377,24 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 			return -1;
 		}
 	}
-#ifndef _WIN32
-	fcntl(host->sock, F_SETFL, arg);
-#endif
 
 	unsigned int size = htonl(32);
 	addToBuffer(loop, host, host->sock, (unsigned char *)&size, sizeof(int));
 	addToBuffer(loop, host, host->sock, local_public_key, 32);
 
+#ifndef _WIN32
+	DEBUG_INFO("connect request to %s:%i\n", host->hostname, host->port);
+#else
 	DEBUG_INFO("connected to %s:%i\n", host->hostname, host->port);
+#endif
 
 	loop_add_io_data(loop, host->sock, DOOPS_READWRITE, host);
 
+#ifndef _WIN32
+	host->timestamp = time(NULL) - 470;
+#else
 	host->timestamp = time(NULL);
+#endif
 	return 0;
 }
 
@@ -1566,7 +1584,7 @@ int main(int argc, char **argv) {
 				if ((!hosts[i].sock) || (time(NULL) - hosts[i].timestamp >= 480)) {
 					client_connect(loop, &hosts[i], local_public_key);
 				} else {
-					if (hosts[i].sock)
+					if ((hosts[i].sock) && (!hosts[i].connect_request))
 						sendData(loop, &hosts[i], hosts[i].sock, (const unsigned char *)"PING", 4, public_key, private_key, local_public_key, local_private_key, hosts[i].public_key, hash_table);
 					if (hosts[i].sock_accept)
 						sendData(loop, &hosts[i], hosts[i].sock_accept, (const unsigned char *)"PING", 4, public_key, private_key, local_public_key, local_private_key, hosts[i].public_key, hash_table);
