@@ -1390,11 +1390,7 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 
 	loop_add_io_data(loop, host->sock, DOOPS_READWRITE, host);
 
-#ifndef _WIN32
-	host->timestamp = time(NULL) - 470;
-#else
 	host->timestamp = time(NULL);
-#endif
 	return 0;
 }
 
@@ -1581,7 +1577,7 @@ int main(int argc, char **argv) {
 		loop_schedule(&loop, {
 			int i;
 			for (i = 0; i < clients; i ++) {
-				if ((!hosts[i].sock) || (time(NULL) - hosts[i].timestamp >= 480)) {
+				if ((!hosts[i].sock) || (time(NULL) - hosts[i].timestamp >= 480) || ((hosts[i].connect_request) && (time(NULL) - hosts[i].connect_request >= 48))) {
 					client_connect(loop, &hosts[i], local_public_key);
 				} else {
 					if ((hosts[i].sock) && (!hosts[i].connect_request))
@@ -1616,6 +1612,17 @@ int main(int argc, char **argv) {
 		if (!host) {
 			loop_pause_write_io(loop, sock);
 			return;
+		} else
+		if (host->connect_request) {
+#ifndef _WIN32
+			int arg = fcntl(sock, F_GETFL, NULL);
+			if (arg > 0)
+				fcntl(sock, F_SETFL, arg & (~O_NONBLOCK));
+
+			host->connect_request = 0;
+			DEBUG_INFO("connected to %s:%i\n", host->hostname, host->port);
+			return;
+#endif
 		}
 
 		if (sock == host->sock) {
