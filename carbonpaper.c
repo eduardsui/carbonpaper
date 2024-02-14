@@ -1352,6 +1352,12 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 
 	host->sock = socket(AF_INET, SOCK_STREAM, 0);
 
+	struct timeval tv;
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	setsockopt(host->sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+	setsockopt(host->sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+
 	host->servaddr.sin_family = AF_INET;
 	host->servaddr.sin_addr.s_addr = inet_addr(host->hostname);
 	host->servaddr.sin_port = htons(host->port);
@@ -1414,7 +1420,7 @@ int main(int argc, char **argv) {
 	WSAStartup(wVersionRequested, &wsaData);
 #endif
 
-	fprintf(stderr, "carbonpaper v0.1 - real-time bidirectional directory synchronization tool\n(c)2023 by Eduard Suica (BSD-simplified license)\n\n");
+	fprintf(stderr, "carbonpaper v0.1 - real-time bidirectional directory synchronization tool\n(c)2023 - 2024 by Eduard Suica (BSD-simplified license)\n\n");
 
 	int path_index = 1;
 	int i;
