@@ -61,7 +61,7 @@
 
 #define EVENT_SIZE		(sizeof (struct inotify_event))
 #define EVENT_BUF_LEN		(1024 * (EVENT_SIZE + 16 ))
-#define INOTIFY_CACHE		EVENT_SIZE
+#define INOTIFY_CACHE		1024
 
 #define MAX_MESSAGE		0x48000000
 #define MAX_FILESIZE		MAX_MESSAGE - 0x400
