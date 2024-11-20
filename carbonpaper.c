@@ -459,8 +459,8 @@ void clearCache(char **to_delete, int *to_delete_files, const char *path_buf) {
 			free(to_delete[i]);
 			for (j = i; j < *to_delete_files - 1; j ++)
 				to_delete[j] = to_delete[j + 1];
-			to_delete[*to_delete_files] = 0;
 			(*to_delete_files) --;
+			to_delete[*to_delete_files] = 0;
 			i --;
 		}
 	}
