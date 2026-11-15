@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <sys/types.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
@@ -41,7 +40,7 @@
 
 	#undef MAX_PATH
 
-	#define open(path, oflag , pmode)   _open(path, oflag | O_BINARY, 0)
+	#define open(path, oflag, pmode) _open(path, (oflag) | O_BINARY, (pmode) | _S_IREAD | _S_IWRITE)
 #else
 	#include <netdb.h>
 	#include <netinet/in.h>
@@ -49,6 +48,7 @@
 	#include <sys/inotify.h>
 	#include <sys/socket.h>
 	#include <sys/time.h>
+	#include <sys/file.h>
 
 	#define WITH_POLL
 
@@ -98,6 +98,9 @@ struct remote_client {
 	int write_buffer_len_a;
 
 	time_t connect_request;
+
+	int have_key;
+	int have_key_a;
 };
 
 static struct remote_client *hosts = NULL;
@@ -217,6 +220,7 @@ void closeSocket(int sock) {
 			free(hosts[i].write_buffer);
 			hosts[i].write_buffer = 0;
 			hosts[i].write_buffer_len = 0;
+			hosts[i].have_key = 0;
 			break;
 		}
 		if (hosts[i].sock_accept == sock) {
@@ -224,16 +228,16 @@ void closeSocket(int sock) {
 			free(hosts[i].write_buffer_a);
 			hosts[i].write_buffer_a = 0;
 			hosts[i].write_buffer_len_a = 0;
+			hosts[i].have_key_a = 0;
 			break;
 		}
 	}
+#ifndef _WIN32
 	close(sock);
+#else
+	closesocket(sock);
+#endif
 	DEBUG_PRINT("remove socket\n");
-}
-
-int sharedSecret(unsigned char shared[32], unsigned char local_private_key[32], unsigned char remote_public_key[32]) {
-	crypto_x25519(shared, local_private_key, remote_public_key);
-	return 0;
 }
 
 static int randomBytes(unsigned char *out, size_t len) {
@@ -260,6 +264,14 @@ static int randomBytes(unsigned char *out, size_t len) {
 }
 
 #ifdef CARBONPAPER_UNSAFE
+
+#define NONCE_SIZE 0
+
+int sharedSecret(unsigned char shared[32], unsigned char local_private_key[32], unsigned char remote_public_key[32]) {
+	crypto_x25519(shared, local_private_key, remote_public_key);
+	return 0;
+}
+
 int encrypt(const unsigned char *pt, unsigned char *ct, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], int ctr) {
 	unsigned char key[32];
 	sharedSecret(key, local_private_key, remote_public_key);
@@ -293,6 +305,7 @@ int decryptVerify(unsigned char *ct, unsigned char *pt, int size, unsigned char 
 	return decrypt(ct, pt, size - 64, local_private_key, remote_public_key, ctr);
 }
 #else
+
 #define NONCE_SIZE 8
 
 static int deriveKey(unsigned char key[32], unsigned char local_private_key[32], unsigned char remote_public_key[32]) {
@@ -338,7 +351,12 @@ int decryptVerify(unsigned char *ct, unsigned char *pt, int size, unsigned char 
 #endif
 
 int sendData(struct doops_loop *loop, struct remote_client *host, int socket, const unsigned char *data, int len, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], unsigned char remote_public_key[32], khash_t(fd_to_name) *hash_table) {
-	int msg_size = len + sizeof(int) + 64;
+	if ((socket == host->sock) ? !host->have_key : !host->have_key_a) {
+		// silently skip until the key arrives
+		return 0;
+	}
+	
+	int msg_size = len + NONCE_SIZE + sizeof(int) + 64;
 	unsigned char *buffer = (unsigned char *)malloc(msg_size);
 	if (!buffer) {
 		perror("malloc");
@@ -350,7 +368,7 @@ int sendData(struct doops_loop *loop, struct remote_client *host, int socket, co
 	*(int *)buffer = htonl(msg_size - sizeof(int));
 
 	if (encryptSign(data, buffer + sizeof(int), len, local_private_key, remote_public_key, private_key, 0) <= 0) {
-		DEBUG_PRINT("encryption error");
+		DEBUG_PRINT("encryption error\n");
 		free(buffer);
 		loop_remove_io(loop, socket);
 		closeSocket(socket);
@@ -971,6 +989,12 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 		buffer = (unsigned char *)malloc(*size);
 		if (buffer) {
 			int bytes_read = snprintf((char *)buffer, 4096, "%s\n%u.%u:%o:%s\n", method, (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
+			if ((bytes_read < 0) || (bytes_read >= 4096)) {
+				perror("snprintf");
+				*size = -1;
+				free(buffer);
+				return NULL;
+			}
 			int link_buf = readlink(path, (char *)buffer + bytes_read, *size - bytes_read);
 			if (link_buf < 0) {
 				perror("readlink");
@@ -1001,6 +1025,14 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 		buffer = (unsigned char *)malloc(*size + 4096);
 		if (buffer) {
 			int bytes_read = snprintf((char *)buffer, 4096, "DATA\n%u.%u:%o:%s\n", (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
+			if ((bytes_read < 0) || (bytes_read >= 4096)) {
+				free(buffer);
+#ifndef _WIN32
+				flock(fd, LOCK_UN);
+#endif
+				close(fd);
+				return NULL;
+			}	
 			*size += bytes_read;
 			while (bytes_read < *size) {
 				int bytes = read(fd, buffer + bytes_read, *size - bytes_read);
@@ -1097,6 +1129,10 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 			closeSocket(socket);
 			return -1;
 		}
+		if (socket == host->sock)
+			host->have_key = 1;
+		else
+			host->have_key_a = 1;		
 		DEBUG_PRINT("received host public key\n");
 		return sendData(loop, host, socket, (const unsigned char *)"SYNC", 4, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table);
 	}
@@ -1135,6 +1171,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 		closeSocket(socket);
 		return -1;
 	}
+	memset(pt, 0, msg_size + 1);
 	int size = decryptVerify(buffer, pt, len_received, local_private_key, host->public_key, public_key, 0);
 	if (size <= 0) {
 		free(pt);
@@ -1160,7 +1197,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 					sendData(loop, host, socket, (const unsigned char *)data, data_size, public_key, private_key, local_public_key, local_private_key, host->public_key, hash_table);
 				free(data);
 			} else
-			if (memcmp(pt, "PULL", 4) == 0) {
+			if ((memcmp(pt, "PULL", 4) == 0) && (size >= 5)) {
 				snprintf(full_path, sizeof(full_path), "%s/%s", root_path, pt + 5);
 				int fsize = -1;
 				unsigned char *file_data = readFileAuto(full_path, &fsize, "DATA");
@@ -1171,7 +1208,7 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 				}
 				free(file_data);
 			} else
-			if (memcmp(pt, "UPDT", 4) == 0) {
+			if ((memcmp(pt, "UPDT", 4) == 0) && (size >= 5)) {
 				snprintf(full_path, sizeof(full_path), "%s/%s", root_path, pt + 5);
 				int fsize = -1;
 				unsigned char *file_data = readFileAuto(full_path, &fsize, "FILE");
@@ -1182,13 +1219,13 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 				}
 				free(file_data);
 			} else
-			if (memcmp(pt, "DATA", 4) == 0) {
+			if ((memcmp(pt, "DATA", 4) == 0) && (size >= 5)) {
 				writeFileAuto(pt + 5, size - 5, inotify_fd, hash_table, 0);
 			} else
-			if (memcmp(pt, "FILE", 4) == 0) {
+			if ((memcmp(pt, "FILE", 4) == 0) && (size >= 5)) {
 				writeFileAuto(pt + 5, size - 5, inotify_fd, hash_table, 1);
 			} else
-			if ((memcmp(pt, "LIST", 4) == 0) || (is_desc)) {
+			if (((memcmp(pt, "LIST", 4) == 0) || (is_desc)) && (size >= 5)) {
 				char *list = (char *)pt + 5;
 				char *line = list;
 				while (line) {
@@ -1346,10 +1383,11 @@ void *validHost(struct doops_loop *loop, struct sockaddr_in *client_addr, int so
 		if (hosts[i].servaddr.sin_addr.s_addr == client_addr->sin_addr.s_addr) {
 			if (hosts[i].sock_accept) {
 				loop_remove_io(loop, hosts[i].sock_accept);
-				close(hosts[i].sock_accept);
+				closeSocket(hosts[i].sock_accept);
 				free(hosts[i].write_buffer_a);
 				hosts[i].write_buffer_a = NULL;
 				hosts[i].write_buffer_len_a = 0;
+				hosts[i].have_key_a = 0;
 			}
 			hosts[i].sock_accept = sock;
 		
@@ -1374,13 +1412,14 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 
 	if (host->sock) {
 		loop_remove_io(loop, host->sock);
-		close(host->sock);
+		closeSocket(host->sock);
 		free(host->write_buffer);
 		host->write_buffer = NULL;
 		host->write_buffer_len = 0;
 	}
 
 	host->sock = socket(AF_INET, SOCK_STREAM, 0);
+	host->have_key = 0;
 
 #ifndef _WIN32
 	struct timeval tv;
@@ -1412,7 +1451,7 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 		{
 			perror("connect");
 			DEBUG_PRINT("error connecting to %s:%i\n", host->hostname, host->port);
-			close(host->sock);
+			closeSocket(host->sock);
 			host->sock = 0;
 			return -1;
 		}
@@ -1463,7 +1502,10 @@ int main(int argc, char **argv) {
 			if (i + 1 < argc) {
 				i ++;
 				key_path = argv[i];
-				genKey(key_path);
+				if (genKey(key_path)) {
+					fprintf(stderr, "error generating key\n");
+					exit(1);
+				}
 				path_index = i + 1;
 				if (path_index == argc)
 					exit(0);
@@ -1515,7 +1557,7 @@ int main(int argc, char **argv) {
 				clients ++;
 				path_index = i + 1;
 			} else {
-				fprintf(stderr, "--port: port number missing\n");
+				fprintf(stderr, "--host: host missing\n");
 				exit(1);
 			}
 		} else
@@ -1740,15 +1782,23 @@ int main(int argc, char **argv) {
 				void *host_data = validHost(loop, &client_addr, sock, local_public_key);
 				if (host_data) {
 					DEBUG_INFO("accepted connection request\n");
+#ifndef _WIN32
 					struct timeval tv;
 					tv.tv_sec = 1;
 					tv.tv_usec = 0;
+#else
+					DWORD tv = 1000;
+#endif
 					setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 					setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 					loop_add_io_data(loop, sock, DOOPS_READWRITE, host_data);
 				} else {
 					DEBUG_PRINT("connection request from invalid address\n");
+#ifndef _WIN32
 					close(sock);
+#else					
+					closesocket(sock);
+#endif
 				}
 			}
 		} else
