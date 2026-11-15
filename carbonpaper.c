@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <time.h>
 #include <utime.h>
+#include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 	#define WIN32_LEAN_AND_MEAN
@@ -39,7 +41,7 @@
 
 	#undef MAX_PATH
 
-	#define open(path, oflag , pmode)   _open(path, oflag | O_BINARY, 0);
+	#define open(path, oflag , pmode)   _open(path, oflag | O_BINARY, 0)
 #else
 	#include <netdb.h>
 	#include <netinet/in.h>
@@ -64,7 +66,7 @@
 #define INOTIFY_CACHE		1024
 
 #define MAX_MESSAGE		0x48000000
-#define MAX_FILESIZE		MAX_MESSAGE - 0x400
+#define MAX_FILESIZE	(MAX_MESSAGE - 0x400)
 #define MAX_PATH		4096
 
 #define DEBUG_PRINT(f, ...)	fprintf(stderr, "%s [%i] ",timestamp(), __LINE__), fprintf(stderr, (f), ##__VA_ARGS__)				
@@ -234,6 +236,30 @@ int sharedSecret(unsigned char shared[32], unsigned char local_private_key[32], 
 	return 0;
 }
 
+static int randomBytes(unsigned char *out, size_t len) {
+#ifdef _WIN32
+	HCRYPTPROV h = 0;
+	if (!CryptAcquireContext(&h, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
+		return -1;
+	BOOL ok = CryptGenRandom(h, (DWORD)len, out);
+	CryptReleaseContext(h, 0);
+	return ok ? 0 : -1;
+#else
+	int fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0) { perror("open"); return -1; }
+	size_t got = 0;
+	while (got < len) {
+		ssize_t n = read(fd, out + got, len - got);
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) { close(fd); return -1; }
+		got += n;
+	}
+	close(fd);
+	return 0;
+#endif
+}
+
+#ifdef CARBONPAPER_UNSAFE
 int encrypt(const unsigned char *pt, unsigned char *ct, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], int ctr) {
 	unsigned char key[32];
 	sharedSecret(key, local_private_key, remote_public_key);
@@ -266,6 +292,50 @@ int decryptVerify(unsigned char *ct, unsigned char *pt, int size, unsigned char 
 
 	return decrypt(ct, pt, size - 64, local_private_key, remote_public_key, ctr);
 }
+#else
+#define NONCE_SIZE 8
+
+static int deriveKey(unsigned char key[32], unsigned char local_private_key[32], unsigned char remote_public_key[32]) {
+	unsigned char shared[32], acc = 0;
+	int i;
+	crypto_x25519(shared, local_private_key, remote_public_key);
+	for (i = 0; i < 32; i ++)
+		acc |= shared[i];
+	if (!acc)
+		return -1;                       // low-order point / no key yet
+	crypto_blake2b(key, 32, shared, 32);
+	crypto_wipe(shared, 32);
+	return 0;
+}
+
+int encryptSign(const unsigned char *pt, unsigned char *ct, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], unsigned char private_key[64], int ctr) {
+	unsigned char key[32];
+	if (deriveKey(key, local_private_key, remote_public_key))
+		return -1;
+	if (randomBytes(ct, NONCE_SIZE)) {
+		crypto_wipe(key, 32);
+		return -1;
+	}
+	crypto_chacha20_djb(ct + NONCE_SIZE, pt, size, key, ct, ctr);   // ct[0..8) is the nonce
+	crypto_wipe(key, 32);
+	crypto_eddsa_sign(ct + NONCE_SIZE + size, private_key, ct, NONCE_SIZE + size);
+	return NONCE_SIZE + size + 64;
+}
+
+int decryptVerify(unsigned char *ct, unsigned char *pt, int size, unsigned char local_private_key[32], unsigned char remote_public_key[32], unsigned char public_key[32], int ctr) {
+	if (size <= NONCE_SIZE + 64)
+		return -1;
+	int body = size - 64;
+	if (crypto_eddsa_check(ct + body, public_key, ct, body))
+		return -1;
+	unsigned char key[32];
+	if (deriveKey(key, local_private_key, remote_public_key))
+		return -1;
+	crypto_chacha20_djb(pt, ct + NONCE_SIZE, body - NONCE_SIZE, key, ct, ctr);
+	crypto_wipe(key, 32);
+	return body - NONCE_SIZE;
+}
+#endif
 
 int sendData(struct doops_loop *loop, struct remote_client *host, int socket, const unsigned char *data, int len, unsigned char public_key[32], unsigned char private_key[64], unsigned char local_public_key[32], unsigned char local_private_key[32], unsigned char remote_public_key[32], khash_t(fd_to_name) *hash_table) {
 	int msg_size = len + sizeof(int) + 64;
@@ -309,6 +379,8 @@ int notifyEvent(struct doops_loop *loop, char *path, const char *event_type, uns
 	}
 	unsigned char buffer[MAX_PATH * 2];
 	int size = snprintf((char *)buffer, MAX_PATH * 2, "DESC\n%s:%u.%u:%o:%s\n", event_type, (unsigned int)buf.st_mtime, (unsigned int)buf.st_size, buf.st_mode, (char *)path + root_path_len + 1);
+	if ((size < 0) || (size >= MAX_PATH * 2))
+		return -1;	
 	int i = 0;
 	for (i = 0; i < clients; i ++) {
 		if ((hosts[i].sock > 0) && (!hosts[i].connect_request))
@@ -955,32 +1027,8 @@ unsigned char *readFileAuto(char *path, int *size, const char *method) {
 int genKey(const char *path) {
 	unsigned char temp[32];
 
-#ifdef _WIN32
-	HCRYPTPROV hProvider = 0;
-	if (CryptAcquireContext(&hProvider, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
-		if (!CryptGenRandom(hProvider, sizeof(temp), (BYTE *)temp)) {
-			CryptReleaseContext(hProvider, 0);
-			return -1;
-		}
-		CryptReleaseContext(hProvider, 0);
-	}
-#else
-	int fd = open("/dev/random", O_RDONLY);
-	if (fd < 0) {
-		perror("open");
+	if (randomBytes(temp, 32))
 		return -1;
-	}
-	size_t len = 0;
-	while (len < sizeof(temp)) {
-		ssize_t bytes = read(fd, temp + len, sizeof(temp) - len);
-		if (bytes < 0) {
-			close(fd);
-			return -1;
-		}
-		len += bytes;
-	}
-	close(fd);
-#endif
 
 	unsigned char public_key[32];
 	unsigned char private_key[64];
@@ -1000,32 +1048,8 @@ int genKey(const char *path) {
 int genLocalKey(unsigned char private_key[32], unsigned char public_key[32]) {
 	unsigned char temp[32];
 
-#ifdef _WIN32
-	HCRYPTPROV hProvider = 0;
-	if (CryptAcquireContext(&hProvider, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
-		if (!CryptGenRandom(hProvider, sizeof(temp), (BYTE *)temp)) {
-			CryptReleaseContext(hProvider, 0);
-			return -1;
-		}
-		CryptReleaseContext(hProvider, 0);
-	}
-#else
-	int fd = open("/dev/random", O_RDONLY);
-	if (fd < 0) {
-		perror("open");
+	if (randomBytes(temp, 32))
 		return -1;
-	}
-	size_t len = 0;
-	while (len < 32) {
-		ssize_t bytes = read(fd, temp + len, 32 - len);
-		if (bytes < 0) {
-			close(fd);
-			return -1;
-		}
-		len += bytes;
-	}
-	close(fd);
-#endif
 
 	crypto_blake2b(private_key, 32, temp, 32);
 	crypto_x25519_public_key(public_key, private_key);
@@ -1048,10 +1072,11 @@ int receiveData(struct doops_loop *loop, int socket, unsigned char public_key[32
 	char full_path[MAX_PATH];
 
 	ssize_t recv_size = recv(socket, (char *)&msg_size, sizeof(msg_size), MSG_NOSIGNAL);
+	int recv_errno = errno;
 	struct remote_client *host = findHost(socket);
 	if ((recv_size <= 0) || (!host)) {
 #ifndef _WIN32
-		if ((host) && ((errno == EWOULDBLOCK) || (errno == EINPROGRESS))) {
+		if ((host) && ((recv_errno == EWOULDBLOCK) || (recv_errno == EINPROGRESS))) {
 			// not yet connected
 			host->timestamp = time(NULL);
 			return 0;
@@ -1319,8 +1344,13 @@ void *validHost(struct doops_loop *loop, struct sockaddr_in *client_addr, int so
 	int i;
 	for (i = 0; i < clients; i ++) {
 		if (hosts[i].servaddr.sin_addr.s_addr == client_addr->sin_addr.s_addr) {
-			if (hosts[i].sock_accept)
+			if (hosts[i].sock_accept) {
+				loop_remove_io(loop, hosts[i].sock_accept);
 				close(hosts[i].sock_accept);
+				free(hosts[i].write_buffer_a);
+				hosts[i].write_buffer_a = NULL;
+				hosts[i].write_buffer_len_a = 0;
+			}
 			hosts[i].sock_accept = sock;
 		
 			unsigned int size = htonl(32);
@@ -1352,9 +1382,13 @@ int client_connect(struct doops_loop *loop, struct remote_client *host, unsigned
 
 	host->sock = socket(AF_INET, SOCK_STREAM, 0);
 
+#ifndef _WIN32
 	struct timeval tv;
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
+#else
+	DWORD tv = 1000;
+#endif
 	setsockopt(host->sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 	setsockopt(host->sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 
@@ -1517,8 +1551,8 @@ int main(int argc, char **argv) {
 	}
 
 	wd = inotify_add_watch(fd, argv[path_index], INOTIFY_FLAGS);
-	if (fd < 0) {
-		perror("inotify_init");
+	if (wd < 0) {
+		perror("inotify_add_watch");
 		exit(1);
 	}
 #else
@@ -1598,6 +1632,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
 	HANDLE filechanged = CreateFileA(argv[path_index], FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
 	OVERLAPPED overlapped;
+	memset(&overlapped, 0, sizeof(overlapped));
 	overlapped.hEvent = CreateEvent(NULL, FALSE, 0, NULL);
 	uint8_t change_buf[1024];
 
