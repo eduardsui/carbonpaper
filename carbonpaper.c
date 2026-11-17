@@ -1493,7 +1493,7 @@ int main(int argc, char **argv) {
 	WSAStartup(wVersionRequested, &wsaData);
 #endif
 
-	fprintf(stderr, "carbonpaper v0.1 - real-time bidirectional directory synchronization tool\n(c)2023 - 2024 by Eduard Suica (BSD-simplified license)\n\n");
+	fprintf(stderr, "carbonpaper v0.1 - real-time bidirectional directory synchronization tool\n(c)2023 - 2026 by Eduard Suica (BSD-simplified license)\n\n");
 
 	int path_index = 1;
 	int i;
